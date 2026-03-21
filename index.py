@@ -19,7 +19,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 import os
+from twilio.rest import Client as TwilioClient
+
 openai_client = OpenAI(api_key=os.environ['OPENAI_API_KEY'])
+twilio_client = TwilioClient(os.environ['TWILIO_ACCOUNT_SID'], os.environ['TWILIO_AUTH_TOKEN'])
+TWILIO_FROM = os.environ['TWILIO_FROM_NUMBER']  # e.g. +14155551234
 
 dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
 customers_table     = dynamodb.Table('Customers')
@@ -38,11 +42,15 @@ SCRAPE_HEADERS = {
 # ─────────────────────────────────────────────
 
 def get_customer(phone: str) -> Optional[Dict]:
+    print(f"[DYNAMO] Getting customer record for: {phone}")
     response = customers_table.get_item(Key={'customer_id': phone})
-    return response.get('Item')
+    item = response.get('Item')
+    print(f"[DYNAMO] Customer found: {item is not None}")
+    return item
 
 
 def save_customer(phone: str, enquiry: Dict, listings: List[Dict]):
+    print(f"[DYNAMO] Saving customer: {phone} with {len(listings)} listings")
     customers_table.put_item(Item={
         'customer_id':        phone,
         'enquiry_postcode':   enquiry.get('postcode', ''),
@@ -53,18 +61,23 @@ def save_customer(phone: str, enquiry: Dict, listings: List[Dict]):
         'created_at':         datetime.now().isoformat(),
         'status':             'active'
     })
+    print(f"[DYNAMO] Customer saved successfully")
 
 
 def get_conversation_history(phone: str) -> List[Dict]:
+    print(f"[DYNAMO] Fetching conversation history for: {phone}")
     response = conversations_table.query(
+        IndexName='phone_number-timestamp-index',
         KeyConditionExpression=boto3.dynamodb.conditions.Key('phone_number').eq(phone),
-        ScanIndexForward=True  # oldest first
+        ScanIndexForward=True
     )
     items = response.get('Items', [])
+    print(f"[DYNAMO] Found {len(items)} messages in history")
     return [{'role': item['role'], 'content': item['message']} for item in items]
 
 
 def save_message(phone: str, role: str, message: str):
+    print(f"[DYNAMO] Saving message | role={role} | preview={message[:80]}")
     conversations_table.put_item(Item={
         'message_id':   str(uuid.uuid4()),
         'phone_number': phone,
@@ -72,13 +85,14 @@ def save_message(phone: str, role: str, message: str):
         'message':      message,
         'timestamp':    datetime.now().isoformat()
     })
+    print(f"[DYNAMO] Message saved")
 
 
 def reset_customer(phone: str):
-    """Clears customer record so they can start a new enquiry."""
+    print(f"[RESET] Resetting customer: {phone}")
     customers_table.delete_item(Key={'customer_id': phone})
-    # Clear conversations too
     response = conversations_table.query(
+        IndexName='phone_number-timestamp-index',
         KeyConditionExpression=boto3.dynamodb.conditions.Key('phone_number').eq(phone)
     )
     for item in response.get('Items', []):
@@ -86,6 +100,7 @@ def reset_customer(phone: str):
             'message_id': item['message_id'],
             'phone_number': phone
         })
+    print(f"[RESET] Reset complete")
 
 
 # ─────────────────────────────────────────────
@@ -121,12 +136,16 @@ def build_search_url(postcode: str, max_price: int, min_beds: int, prop_type: st
 
 def scrape_exp(postcode: str, max_price: int = 0, min_beds: int = 0, prop_type: str = "Any property type", radius: float = 4) -> List[Dict]:
     url = build_search_url(postcode, max_price, min_beds, prop_type, radius)
-    logger.info(f"Scraping: {url}")
+    print(f"[SCRAPER] Built URL: {url}")
 
     try:
+        print(f"[SCRAPER] Sending HTTP request...")
         response = requests.get(url, headers=SCRAPE_HEADERS, timeout=15)
+        print(f"[SCRAPER] Response status: {response.status_code}")
         response.raise_for_status()
+
         soup = BeautifulSoup(response.text, 'html.parser')
+        print(f"[SCRAPER] Page parsed, searching for aProperties...")
 
         aProperties = []
         for script in soup.find_all('script'):
@@ -134,9 +153,10 @@ def scrape_exp(postcode: str, max_price: int = 0, min_beds: int = 0, prop_type: 
                 match = re.search(r'const aProperties = (\[.*?\]);', script.string, re.DOTALL)
                 if match:
                     aProperties = json.loads(match.group(1))
+                    print(f"[SCRAPER] Found aProperties block with {len(aProperties)} items")
 
         if not aProperties:
-            logger.warning("No properties found")
+            print(f"[SCRAPER] No aProperties found in page scripts")
             return []
 
         results = []
@@ -164,10 +184,11 @@ def scrape_exp(postcode: str, max_price: int = 0, min_beds: int = 0, prop_type: 
                 'url':           "https://exp.uk.com" + p['property_url_part'],
             })
 
-        logger.info(f"Found {len(results)} properties")
+        print(f"[SCRAPER] Returning {len(results)} properties")
         return results
 
     except Exception as e:
+        print(f"[SCRAPER] ERROR: {e}")
         logger.error(f"Scraping error: {e}")
         return []
 
@@ -177,7 +198,7 @@ def scrape_exp(postcode: str, max_price: int = 0, min_beds: int = 0, prop_type: 
 # ─────────────────────────────────────────────
 
 def extract_enquiry_details(message: str) -> Dict:
-    """Use ChatGPT to pull postcode, bedrooms, price, type from a customer's first message."""
+    print(f"[OPENAI] Extracting enquiry details from message: {message[:100]}")
     response = openai_client.chat.completions.create(
         model="gpt-4o",
         max_tokens=300,
@@ -197,33 +218,37 @@ def extract_enquiry_details(message: str) -> Dict:
     )
     try:
         text = response.choices[0].message.content.strip()
+        print(f"[OPENAI] Raw response: {text}")
         text = re.sub(r'```json|```', '', text).strip()
-        return json.loads(text)
+        parsed = json.loads(text)
+        print(f"[OPENAI] Parsed enquiry: {parsed}")
+        return parsed
     except Exception as e:
+        print(f"[OPENAI] ERROR parsing enquiry: {e}")
         logger.error(f"Failed to parse enquiry details: {e}")
         return {"postcode": "", "bedrooms": 0, "max_price": 0, "prop_type": "Any property type"}
 
 
 def get_ai_response(phone: str, user_message: str, listings: List[Dict]) -> str:
-    """Get ChatGPT response with property listings as context."""
-
+    print(f"[OPENAI] Getting AI response for {phone} | message: {user_message[:100]}")
     history = get_conversation_history(phone)
+    print(f"[OPENAI] Using {len(history)} messages of history and {len(listings)} listings")
 
     listings_summary = "\n".join([
         f"- {p['address']} | {p['price']} | {p['bedrooms']} bed {p['property_type']} | {p['status']} | {p['url']}"
-        for p in listings[:20]  # Cap at 20 to stay within token limits
+        for p in listings[:20]
     ])
 
     system_prompt = f"""You are a friendly UK property agent assistant communicating via SMS.
-You are helping a customer find properties similar to one they enquired about.
+You are helping a customer find properties for a buyer.
 
-Here are the matching properties we found:
+Here are ALL the matching properties we found:
 {listings_summary}
 
 Guidelines:
-- Keep responses concise (SMS format, under 300 words)
+- List ALL properties above, not just a few — the customer wants to see everything available
+- For each property include: address, price, number of beds, property type, and URL
 - Be helpful and professional
-- When recommending properties, include the price and address
 - If asked for more details on a specific property, provide them
 - You can suggest the customer reply with 'reset' to start a new search"""
 
@@ -231,11 +256,31 @@ Guidelines:
 
     response = openai_client.chat.completions.create(
         model="gpt-4o",
-        max_tokens=500,
+        max_tokens=2000,
         messages=messages
     )
 
-    return response.choices[0].message.content.strip()
+    reply = response.choices[0].message.content.strip()
+    print(f"[OPENAI] AI reply: {reply[:200]}")
+    return reply
+
+
+# ─────────────────────────────────────────────
+# Send SMS directly via Twilio API
+# ─────────────────────────────────────────────
+
+def send_sms(to: str, body: str):
+    """Send an SMS proactively via Twilio REST API (not via TwiML webhook return)."""
+    print(f"[TWILIO] Sending SMS to {to} | preview: {body[:80]}")
+    if len(body) <= 1600:
+        messages = [body]
+    else:
+        chunks = [body[i:i+1550] for i in range(0, len(body), 1550)]
+        messages = [f"({i+1}/{len(chunks)}) {chunk}" for i, chunk in enumerate(chunks)]
+
+    for msg in messages:
+        twilio_client.messages.create(to=to, from_=TWILIO_FROM, body=msg)
+    print(f"[TWILIO] Sent {len(messages)} message(s)")
 
 
 # ─────────────────────────────────────────────
@@ -250,16 +295,20 @@ def twiml_response(messages):
 
 
 def parse_body(event):
+    print(f"[PARSE] Raw event body: {str(event.get('body', ''))[:300]}")
     raw = event.get('body', '')
     if event.get('isBase64Encoded'):
         import base64
         raw = base64.b64decode(raw).decode('utf-8')
+        print(f"[PARSE] Decoded base64 body: {raw[:300]}")
     params = dict(p.split('=', 1) for p in raw.split('&') if '=' in p)
     from urllib.parse import unquote_plus
-    return {
+    result = {
         'body': unquote_plus(params.get('Body', '')),
         'from': unquote_plus(params.get('From', ''))
     }
+    print(f"[PARSE] Parsed -> from={result['from']} | body={result['body']}")
+    return result
 
 
 # ─────────────────────────────────────────────
@@ -267,18 +316,30 @@ def parse_body(event):
 # ─────────────────────────────────────────────
 
 def handler(event, context):
+    print(f"[HANDLER] Invoked. Event keys: {list(event.keys())}")
+
     # Health check
     if event.get('requestContext', {}).get('http', {}).get('method') == 'GET':
+        print(f"[HANDLER] Health check request")
         return {'statusCode': 200, 'body': 'Property bot is running ✅'}
 
-    parsed   = parse_body(event)
-    phone    = parsed['from']
-    message  = parsed['body'].strip()
+    parsed  = parse_body(event)
+    phone   = parsed['from']
+    message = parsed['body'].strip()
 
-    logger.info(f"Message from {phone}: {message}")
+    print(f"[HANDLER] phone={phone!r} | message={message!r}")
+
+    if not phone:
+        print(f"[HANDLER] ERROR: Empty phone number, cannot proceed")
+        return {
+            'statusCode': 200,
+            'headers': {'Content-Type': 'text/xml'},
+            'body': twiml_response("Could not identify your phone number.")
+        }
 
     # Handle reset
     if message.lower() == 'reset':
+        print(f"[HANDLER] Reset requested by {phone}")
         reset_customer(phone)
         return {
             'statusCode': 200,
@@ -287,29 +348,39 @@ def handler(event, context):
         }
 
     try:
+        print(f"[HANDLER] Checking if customer exists...")
         customer = get_customer(phone)
-        
 
-        # ── New customer: extract details, scrape, save ──
         if not customer:
+            print(f"[HANDLER] New customer flow")
             save_message(phone, 'user', message)
 
-            # Tell the customer we're working on it
-            # (Note: Twilio only gets one response per webhook, so we respond after scraping)
+            # ── Immediately acknowledge so Twilio doesn't time out ──
+            ack = "Got it! Searching for properties now, I'll send you the results in a moment... 🏡"
+            save_message(phone, 'assistant', ack)
+            print(f"[HANDLER] Sending acknowledgement via TwiML...")
+            # We return the ack immediately, then Twilio closes the webhook.
+            # The rest of the work happens before we return — Lambda keeps running.
+            # To truly async this you'd need a second Lambda, but for now we
+            # send the ack via Twilio API and return an empty TwiML response.
+            send_sms(phone, ack)
 
+            print(f"[HANDLER] Extracting enquiry details...")
             enquiry = extract_enquiry_details(message)
             logger.info(f"Extracted enquiry: {enquiry}")
 
             if not enquiry.get('postcode'):
+                print(f"[HANDLER] No postcode found, asking user")
                 reply = "Hi! I'm your property assistant. Please send me your enquiry including the postcode or area, number of bedrooms, and budget. E.g. 'Looking for a 2 bed flat in M4 under £250,000'"
                 save_message(phone, 'assistant', reply)
+                send_sms(phone, reply)
                 return {
                     'statusCode': 200,
                     'headers': {'Content-Type': 'text/xml'},
-                    'body': twiml_response(reply)
+                    'body': '<Response></Response>'
                 }
 
-            # Run the scrape
+            print(f"[HANDLER] Scraping listings for postcode={enquiry['postcode']}...")
             listings = scrape_exp(
                 postcode=enquiry['postcode'],
                 max_price=enquiry.get('max_price', 0),
@@ -318,36 +389,46 @@ def handler(event, context):
             )
 
             if not listings:
+                print(f"[HANDLER] No listings found")
                 reply = f"I searched for properties in {enquiry['postcode']} but couldn't find any matching results. Could you try a different postcode or broaden your criteria?"
                 save_message(phone, 'assistant', reply)
+                send_sms(phone, reply)
                 return {
                     'statusCode': 200,
                     'headers': {'Content-Type': 'text/xml'},
-                    'body': twiml_response(reply)
+                    'body': '<Response></Response>'
                 }
 
-            # Save customer + listings
+            print(f"[HANDLER] Saving customer and {len(listings)} listings...")
             save_customer(phone, enquiry, listings)
 
-            # Get AI to introduce the results
-            intro_prompt = f"Introduce yourself and summarise the {len(listings)} properties you found for their enquiry. Give the top 3 most relevant ones with prices."
+            print(f"[HANDLER] Getting AI intro response...")
+            intro_prompt = f"Introduce yourself briefly, then list ALL {len(listings)} properties you found with their address, price, bed count, type, and URL. Do not summarise — list every single one."
             reply = get_ai_response(phone, intro_prompt, listings)
+            save_message(phone, 'assistant', reply)
+            send_sms(phone, reply)
+            return {
+                'statusCode': 200,
+                'headers': {'Content-Type': 'text/xml'},
+                'body': '<Response></Response>'
+            }
 
-        # ── Returning customer: answer their question ──
         else:
+            print(f"[HANDLER] Returning customer flow")
             save_message(phone, 'user', message)
             listings = json.loads(customer.get('scraped_listings', '[]'))
+            print(f"[HANDLER] Loaded {len(listings)} listings from customer record")
             reply = get_ai_response(phone, message, listings)
 
         save_message(phone, 'assistant', reply)
 
-        # Split long replies for SMS
         if len(reply) <= 1600:
             sms_messages = [reply]
         else:
             chunks = [reply[i:i+1550] for i in range(0, len(reply), 1550)]
             sms_messages = [f"({i+1}/{len(chunks)}) {chunk}" for i, chunk in enumerate(chunks)]
 
+        print(f"[HANDLER] Sending {len(sms_messages)} SMS message(s)")
         return {
             'statusCode': 200,
             'headers': {'Content-Type': 'text/xml'},
@@ -355,6 +436,9 @@ def handler(event, context):
         }
 
     except Exception as e:
+        print(f"[HANDLER] UNCAUGHT ERROR: {e}")
+        import traceback
+        print(traceback.format_exc())
         logger.error(f"Error: {e}")
         return {
             'statusCode': 200,
