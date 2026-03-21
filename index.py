@@ -23,7 +23,7 @@ from twilio.rest import Client as TwilioClient
 
 openai_client = OpenAI(api_key=os.environ['OPENAI_API_KEY'])
 twilio_client = TwilioClient(os.environ['TWILIO_ACCOUNT_SID'], os.environ['TWILIO_AUTH_TOKEN'])
-TWILIO_FROM = os.environ['TWILIO_FROM_NUMBER']  # e.g. +14155551234
+TWILIO_FROM = os.environ['TWILIO_FROM_NUMBER']
 
 dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
 customers_table     = dynamodb.Table('Customers')
@@ -43,64 +43,87 @@ SCRAPE_HEADERS = {
 
 def get_customer(phone: str) -> Optional[Dict]:
     print(f"[DYNAMO] Getting customer record for: {phone}")
-    response = customers_table.get_item(Key={'customer_id': phone})
-    item = response.get('Item')
-    print(f"[DYNAMO] Customer found: {item is not None}")
-    return item
+    try:
+        response = customers_table.get_item(Key={'customer_id': phone})
+        item = response.get('Item')
+        print(f"[DYNAMO] Customer found: {item is not None}")
+        return item
+    except Exception as e:
+        print(f"[DYNAMO] ERROR in get_customer: {e}")
+        raise
 
 
 def save_customer(phone: str, enquiry: Dict, listings: List[Dict]):
     print(f"[DYNAMO] Saving customer: {phone} with {len(listings)} listings")
-    customers_table.put_item(Item={
-        'customer_id':        phone,
-        'enquiry_postcode':   enquiry.get('postcode', ''),
-        'enquiry_bedrooms':   enquiry.get('bedrooms', 0),
-        'enquiry_max_price':  enquiry.get('max_price', 0),
-        'enquiry_prop_type':  enquiry.get('prop_type', 'Any property type'),
-        'scraped_listings':   json.dumps(listings),
-        'created_at':         datetime.now().isoformat(),
-        'status':             'active'
-    })
-    print(f"[DYNAMO] Customer saved successfully")
+    try:
+        customers_table.put_item(Item={
+            'customer_id':        phone,
+            'enquiry_postcode':   enquiry.get('postcode', ''),
+            'enquiry_bedrooms':   enquiry.get('bedrooms', 0),
+            'enquiry_max_price':  enquiry.get('max_price', 0),
+            'enquiry_prop_type':  enquiry.get('prop_type', 'Any property type'),
+            'scraped_listings':   json.dumps(listings),
+            'created_at':         datetime.now().isoformat(),
+            'status':             'active'
+        })
+        print(f"[DYNAMO] Customer saved successfully")
+    except Exception as e:
+        print(f"[DYNAMO] ERROR in save_customer: {e}")
+        raise
 
 
 def get_conversation_history(phone: str) -> List[Dict]:
     print(f"[DYNAMO] Fetching conversation history for: {phone}")
-    response = conversations_table.query(
-        IndexName='phone_number-timestamp-index',
-        KeyConditionExpression=boto3.dynamodb.conditions.Key('phone_number').eq(phone),
-        ScanIndexForward=True
-    )
-    items = response.get('Items', [])
-    print(f"[DYNAMO] Found {len(items)} messages in history")
-    return [{'role': item['role'], 'content': item['message']} for item in items]
+    try:
+        response = conversations_table.query(
+            IndexName='phone_number-timestamp-index',
+            KeyConditionExpression=boto3.dynamodb.conditions.Key('phone_number').eq(phone),
+            ScanIndexForward=True
+        )
+        items = response.get('Items', [])
+        print(f"[DYNAMO] Found {len(items)} messages in history")
+        return [{'role': item['role'], 'content': item['message']} for item in items]
+    except Exception as e:
+        print(f"[DYNAMO] ERROR in get_conversation_history: {e}")
+        return []  # Degrade gracefully — lose history but don't crash
 
 
 def save_message(phone: str, role: str, message: str):
     print(f"[DYNAMO] Saving message | role={role} | preview={message[:80]}")
-    conversations_table.put_item(Item={
-        'message_id':   str(uuid.uuid4()),
-        'phone_number': phone,
-        'role':         role,
-        'message':      message,
-        'timestamp':    datetime.now().isoformat()
-    })
-    print(f"[DYNAMO] Message saved")
+    try:
+        conversations_table.put_item(Item={
+            'message_id':   str(uuid.uuid4()),
+            'phone_number': phone,
+            'role':         role,
+            'message':      message,
+            'timestamp':    datetime.now().isoformat()
+        })
+        print(f"[DYNAMO] Message saved")
+    except Exception as e:
+        print(f"[DYNAMO] ERROR in save_message: {e}")
+        # Non-fatal — log and continue
 
 
 def reset_customer(phone: str):
     print(f"[RESET] Resetting customer: {phone}")
-    customers_table.delete_item(Key={'customer_id': phone})
-    response = conversations_table.query(
-        IndexName='phone_number-timestamp-index',
-        KeyConditionExpression=boto3.dynamodb.conditions.Key('phone_number').eq(phone)
-    )
-    for item in response.get('Items', []):
-        conversations_table.delete_item(Key={
-            'message_id': item['message_id'],
-            'phone_number': phone
-        })
-    print(f"[RESET] Reset complete")
+    try:
+        customers_table.delete_item(Key={'customer_id': phone})
+    except Exception as e:
+        print(f"[DYNAMO] ERROR deleting customer: {e}")
+
+    try:
+        response = conversations_table.query(
+            IndexName='phone_number-timestamp-index',
+            KeyConditionExpression=boto3.dynamodb.conditions.Key('phone_number').eq(phone)
+        )
+        for item in response.get('Items', []):
+            conversations_table.delete_item(Key={
+                'message_id': item['message_id'],
+                'phone_number': phone
+            })
+        print(f"[RESET] Reset complete")
+    except Exception as e:
+        print(f"[DYNAMO] ERROR clearing conversation history: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -113,13 +136,15 @@ def extract_postcode(address: str) -> Optional[str]:
 
 
 def build_search_url(postcode: str, max_price: int, min_beds: int, prop_type: str, radius: float = 4) -> str:
-    clean_postcode = postcode.strip().upper().replace(' ', '')
-    url = f"https://exp.uk.com/properties-for-sale/results/?action=search&location={clean_postcode}&search_radii={radius}"
-
-    if max_price > 0:
-        url += f"&max-price={max_price}"
+    from urllib.parse import quote_plus
+    location = postcode.strip()
+    if re.match(r'^[A-Za-z]{1,2}\d', location):
+        location = location.upper().replace(' ', '')
     else:
-        url += "&max-price=0"
+        location = quote_plus(location)
+    url = f"https://exp.uk.com/properties-for-sale/results/?action=search&location={location}&search_radii={radius}"
+
+    url += f"&max-price={max_price}" if max_price > 0 else "&max-price=0"
 
     prop_type_map = {
         "any property type": "0",
@@ -143,7 +168,17 @@ def scrape_exp(postcode: str, max_price: int = 0, min_beds: int = 0, prop_type: 
         response = requests.get(url, headers=SCRAPE_HEADERS, timeout=15)
         print(f"[SCRAPER] Response status: {response.status_code}")
         response.raise_for_status()
+    except requests.exceptions.Timeout:
+        print(f"[SCRAPER] ERROR: Request timed out after 15s")
+        return []
+    except requests.exceptions.HTTPError as e:
+        print(f"[SCRAPER] ERROR: HTTP error {e.response.status_code}: {e}")
+        return []
+    except requests.exceptions.RequestException as e:
+        print(f"[SCRAPER] ERROR: Request failed: {e}")
+        return []
 
+    try:
         soup = BeautifulSoup(response.text, 'html.parser')
         print(f"[SCRAPER] Page parsed, searching for aProperties...")
 
@@ -161,85 +196,128 @@ def scrape_exp(postcode: str, max_price: int = 0, min_beds: int = 0, prop_type: 
 
         results = []
         for p in aProperties:
-            price_text = BeautifulSoup(p['html_price'], 'html.parser').get_text()
-            price_match = re.search(r'£[\d,]+', price_text)
+            try:
+                price_text = BeautifulSoup(p['html_price'], 'html.parser').get_text()
+                price_match = re.search(r'£[\d,]+', price_text)
+                type_match = re.search(r'\d+\s*bedroom[s]?\s+(.+)', p['description'], re.IGNORECASE)
+                prop_type_clean = type_match.group(1).strip() if type_match else "Unknown"
+                postcode_clean = extract_postcode(p['display_address']) or ''
 
-            type_match = re.search(r'\d+\s*bedroom[s]?\s+(.+)', p['description'], re.IGNORECASE)
-            prop_type_clean = type_match.group(1).strip() if type_match else "Unknown"
-
-            postcode_clean = extract_postcode(p['display_address']) or ''
-
-            results.append({
-                'address':       p['display_address'],
-                'status':        "For Sale" if p['status_code'] == 2 else "Sold STC",
-                'price':         price_match.group(0) if price_match else 'POA',
-                'postcode':      postcode_clean,
-                'bedrooms':      p['bedrooms'],
-                'bathrooms':     p['bathrooms'],
-                'receptions':    p['receptionrooms'],
-                'property_type': prop_type_clean,
-                'agent_name':    p['agent_name'],
-                'agent_phone':   p['agent_phone'],
-                'agent_email':   p['agent_email'],
-                'url':           "https://exp.uk.com" + p['property_url_part'],
-            })
+                results.append({
+                    'address':       p['display_address'],
+                    'status':        "For Sale" if p['status_code'] == 2 else "Sold STC",
+                    'price':         price_match.group(0) if price_match else 'POA',
+                    'postcode':      postcode_clean,
+                    'bedrooms':      p['bedrooms'],
+                    'bathrooms':     p['bathrooms'],
+                    'receptions':    p['receptionrooms'],
+                    'property_type': prop_type_clean,
+                    'agent_name':    p['agent_name'],
+                    'agent_phone':   p['agent_phone'],
+                    'agent_email':   p['agent_email'],
+                    'url':           "https://exp.uk.com" + p['property_url_part'],
+                })
+            except Exception as e:
+                print(f"[SCRAPER] WARNING: Skipping malformed property entry: {e}")
+                continue
 
         print(f"[SCRAPER] Returning {len(results)} properties")
         return results
 
     except Exception as e:
-        print(f"[SCRAPER] ERROR: {e}")
-        logger.error(f"Scraping error: {e}")
+        print(f"[SCRAPER] ERROR parsing page content: {e}")
         return []
 
 
 # ─────────────────────────────────────────────
-# ChatGPT helpers
+# OpenAI helpers
 # ─────────────────────────────────────────────
 
 def extract_enquiry_details(message: str) -> Dict:
     print(f"[OPENAI] Extracting enquiry details from message: {message[:100]}")
-    response = openai_client.chat.completions.create(
-        model="gpt-4o",
-        max_tokens=300,
-        messages=[
-            {
-                "role": "system",
-                "content": """Extract property search details from the message. 
-                Return ONLY valid JSON with these keys:
-                - postcode (string, UK postcode or area e.g. 'M4' or 'SW11')
-                - bedrooms (integer, 0 if not mentioned)
-                - max_price (integer, 0 if not mentioned, no commas)
-                - prop_type (string, one of: 'Any property type', 'Semi-detached house', 'Detached house', 'Flat', 'Bungalow', 'Cottage')
-                If you cannot find a postcode or area, set postcode to empty string."""
-            },
-            {"role": "user", "content": message}
-        ]
-    )
     try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            max_tokens=300,
+            messages=[
+                {
+                    "role": "system",
+                    "content": """Extract property search details from the message.
+                    Return ONLY valid JSON with these keys:
+                    - postcode (string): the location to search — can be a full postcode (e.g. 'SW1A 1AA'), a postcode district (e.g. 'SE8', 'M4'), or a plain area name (e.g. 'Wimbledon', 'Essex', 'Greenwich'). Use whatever the user said as-is — do NOT try to convert area names into postcodes. Empty string if no location found.
+                    - bedrooms (integer, 0 if not mentioned)
+                    - max_price (integer, 0 if not mentioned, no commas)
+                    - prop_type (string, one of: 'Any property type', 'Semi-detached house', 'Detached house', 'Flat', 'Bungalow', 'Cottage')
+                    If you cannot find any location at all, set postcode to empty string."""
+                },
+                {"role": "user", "content": message}
+            ]
+        )
         text = response.choices[0].message.content.strip()
         print(f"[OPENAI] Raw response: {text}")
         text = re.sub(r'```json|```', '', text).strip()
         parsed = json.loads(text)
         print(f"[OPENAI] Parsed enquiry: {parsed}")
         return parsed
-    except Exception as e:
-        print(f"[OPENAI] ERROR parsing enquiry: {e}")
-        logger.error(f"Failed to parse enquiry details: {e}")
+    except json.JSONDecodeError as e:
+        print(f"[OPENAI] ERROR: Failed to parse JSON response: {e}")
         return {"postcode": "", "bedrooms": 0, "max_price": 0, "prop_type": "Any property type"}
+    except Exception as e:
+        print(f"[OPENAI] ERROR in extract_enquiry_details: {e}")
+        return {"postcode": "", "bedrooms": 0, "max_price": 0, "prop_type": "Any property type"}
+
+
+def detect_new_search(message: str, current_postcode: str) -> Dict:
+    print(f"[OPENAI] Detecting if new search requested | current_postcode={current_postcode}")
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            max_tokens=300,
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"""You are a UK property search assistant. The user is currently viewing listings in: {current_postcode}.
+Determine if the user's message is requesting a search in a DIFFERENT area/location.
+
+Return ONLY valid JSON with:
+- new_search (boolean): true if they want listings from a different area, false otherwise
+- postcode (string): the new location if new_search is true — can be a full postcode, postcode district, or plain area name like 'Wimbledon' or 'Essex'. Use whatever the user said as-is. Empty string if new_search is false.
+- bedrooms (integer): number of bedrooms if mentioned, else 0
+- max_price (integer): max price if mentioned, else 0
+- prop_type (string): one of 'Any property type', 'Semi-detached house', 'Detached house', 'Flat', 'Bungalow', 'Cottage'
+
+Examples that ARE a new search: "what about se1?", "can you check greenwich", "show me places in e3", "actually look in lewisham"
+Examples that are NOT a new search: "tell me more about the first one", "which has a garden?", "what is the cheapest?"
+"""
+                },
+                {"role": "user", "content": message}
+            ]
+        )
+        text = response.choices[0].message.content.strip()
+        text = re.sub(r'```json|```', '', text).strip()
+        parsed = json.loads(text)
+        print(f"[OPENAI] New search detection result: {parsed}")
+        return parsed
+    except json.JSONDecodeError as e:
+        print(f"[OPENAI] ERROR: Failed to parse JSON in detect_new_search: {e}")
+        return {"new_search": False, "postcode": "", "bedrooms": 0, "max_price": 0, "prop_type": "Any property type"}
+    except Exception as e:
+        print(f"[OPENAI] ERROR in detect_new_search: {e}")
+        return {"new_search": False, "postcode": "", "bedrooms": 0, "max_price": 0, "prop_type": "Any property type"}
 
 
 def get_ai_response(phone: str, user_message: str, listings: List[Dict]) -> str:
     print(f"[OPENAI] Getting AI response for {phone} | message: {user_message[:100]}")
-    history = get_conversation_history(phone)
-    print(f"[OPENAI] Using {len(history)} messages of history and {len(listings)} listings")
+    try:
+        history = get_conversation_history(phone)
+        print(f"[OPENAI] Using {len(history)} messages of history and {len(listings)} listings")
 
-    listings_summary = "\n".join([
-        f"- {p['address']} | {p['price']} | {p['bedrooms']} bed {p['property_type']} | {p['status']} | {p['url']}"
-        for p in listings[:20]
-    ])
+        listings_summary = "\n".join([
+            f"- {p['address']} | {p['price']} | {p['bedrooms']} bed {p['property_type']} | {p['status']} | {p['url']}"
+            for p in listings[:20]
+        ])
 
-    system_prompt = f"""You are a friendly UK property agent assistant communicating via SMS.
+        system_prompt = f"""You are a friendly UK property agent assistant communicating via SMS.
 You are helping a customer find properties for a buyer.
 
 Here are ALL the matching properties we found:
@@ -252,17 +330,20 @@ Guidelines:
 - If asked for more details on a specific property, provide them
 - You can suggest the customer reply with 'reset' to start a new search"""
 
-    messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_message}]
+        messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_message}]
 
-    response = openai_client.chat.completions.create(
-        model="gpt-4o",
-        max_tokens=2000,
-        messages=messages
-    )
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            max_tokens=2000,
+            messages=messages
+        )
 
-    reply = response.choices[0].message.content.strip()
-    print(f"[OPENAI] AI reply: {reply[:200]}")
-    return reply
+        reply = response.choices[0].message.content.strip()
+        print(f"[OPENAI] AI reply: {reply[:200]}")
+        return reply
+    except Exception as e:
+        print(f"[OPENAI] ERROR in get_ai_response: {e}")
+        raise
 
 
 # ─────────────────────────────────────────────
@@ -270,17 +351,20 @@ Guidelines:
 # ─────────────────────────────────────────────
 
 def send_sms(to: str, body: str):
-    """Send an SMS proactively via Twilio REST API (not via TwiML webhook return)."""
     print(f"[TWILIO] Sending SMS to {to} | preview: {body[:80]}")
-    if len(body) <= 1600:
-        messages = [body]
-    else:
-        chunks = [body[i:i+1550] for i in range(0, len(body), 1550)]
-        messages = [f"({i+1}/{len(chunks)}) {chunk}" for i, chunk in enumerate(chunks)]
+    try:
+        if len(body) <= 1600:
+            messages = [body]
+        else:
+            chunks = [body[i:i+1550] for i in range(0, len(body), 1550)]
+            messages = [f"({i+1}/{len(chunks)}) {chunk}" for i, chunk in enumerate(chunks)]
 
-    for msg in messages:
-        twilio_client.messages.create(to=to, from_=TWILIO_FROM, body=msg)
-    print(f"[TWILIO] Sent {len(messages)} message(s)")
+        for msg in messages:
+            twilio_client.messages.create(to=to, from_=TWILIO_FROM, body=msg)
+        print(f"[TWILIO] Sent {len(messages)} message(s)")
+    except Exception as e:
+        print(f"[TWILIO] ERROR sending SMS to {to}: {e}")
+        raise
 
 
 # ─────────────────────────────────────────────
@@ -355,14 +439,9 @@ def handler(event, context):
             print(f"[HANDLER] New customer flow")
             save_message(phone, 'user', message)
 
-            # ── Immediately acknowledge so Twilio doesn't time out ──
+            # Immediately acknowledge so Twilio doesn't time out
             ack = "Got it! Searching for properties now, I'll send you the results in a moment... 🏡"
             save_message(phone, 'assistant', ack)
-            print(f"[HANDLER] Sending acknowledgement via TwiML...")
-            # We return the ack immediately, then Twilio closes the webhook.
-            # The rest of the work happens before we return — Lambda keeps running.
-            # To truly async this you'd need a second Lambda, but for now we
-            # send the ack via Twilio API and return an empty TwiML response.
             send_sms(phone, ack)
 
             print(f"[HANDLER] Extracting enquiry details...")
@@ -416,9 +495,60 @@ def handler(event, context):
         else:
             print(f"[HANDLER] Returning customer flow")
             save_message(phone, 'user', message)
-            listings = json.loads(customer.get('scraped_listings', '[]'))
-            print(f"[HANDLER] Loaded {len(listings)} listings from customer record")
-            reply = get_ai_response(phone, message, listings)
+            current_postcode = customer.get('enquiry_postcode', '')
+
+            # Check if user is asking to search a new area
+            detection = detect_new_search(message, current_postcode)
+
+            if detection.get('new_search') and detection.get('postcode'):
+                new_postcode = detection['postcode']
+                print(f"[HANDLER] New area requested: {new_postcode}")
+
+                ack = f"Sure! Searching for properties in {new_postcode} now... 🏡"
+                save_message(phone, 'assistant', ack)
+                send_sms(phone, ack)
+
+                listings = scrape_exp(
+                    postcode=new_postcode,
+                    max_price=detection.get('max_price', 0),
+                    min_beds=detection.get('bedrooms', 0),
+                    prop_type=detection.get('prop_type', 'Any property type')
+                )
+
+                if not listings:
+                    reply = f"I searched in {new_postcode} but couldn't find any matching results. Try a different area or broaden your criteria?"
+                    save_message(phone, 'assistant', reply)
+                    send_sms(phone, reply)
+                    return {
+                        'statusCode': 200,
+                        'headers': {'Content-Type': 'text/xml'},
+                        'body': '<Response></Response>'
+                    }
+
+                enquiry = {
+                    'postcode':  new_postcode,
+                    'bedrooms':  detection.get('bedrooms', customer.get('enquiry_bedrooms', 0)),
+                    'max_price': detection.get('max_price', customer.get('enquiry_max_price', 0)),
+                    'prop_type': detection.get('prop_type', customer.get('enquiry_prop_type', 'Any property type')),
+                }
+                save_customer(phone, enquiry, listings)
+                print(f"[HANDLER] Updated customer with {len(listings)} new listings for {new_postcode}")
+
+                intro_prompt = f"The user asked to search a new area: {new_postcode}. List ALL {len(listings)} properties found with address, price, bed count, type, and URL. Do not summarise — list every single one."
+                reply = get_ai_response(phone, intro_prompt, listings)
+                save_message(phone, 'assistant', reply)
+                send_sms(phone, reply)
+                return {
+                    'statusCode': 200,
+                    'headers': {'Content-Type': 'text/xml'},
+                    'body': '<Response></Response>'
+                }
+
+            else:
+                # Normal follow-up question about existing listings
+                listings = json.loads(customer.get('scraped_listings', '[]'))
+                print(f"[HANDLER] Loaded {len(listings)} listings from customer record")
+                reply = get_ai_response(phone, message, listings)
 
         save_message(phone, 'assistant', reply)
 
