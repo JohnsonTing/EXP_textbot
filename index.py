@@ -58,12 +58,22 @@ def save_customer(phone: str, enquiry: Dict, listings: List[Dict]):
     try:
         customers_table.put_item(Item={
             'customer_id':        phone,
+            # ── Contact info ──
+            'contact_name':       enquiry.get('contact_name', ''),
+            'email':              enquiry.get('email', ''),
+            'tags':               enquiry.get('tags', []),
+            # ── Lead details ──
+            'lead_intent':        enquiry.get('lead_intent', ''),
+            'summary':            enquiry.get('summary', ''),
+            'property_in_mind':   enquiry.get('property_in_mind', ''),
+            # ── Search criteria ──
             'enquiry_postcode':   enquiry.get('postcode', ''),
             'enquiry_bedrooms':   enquiry.get('bedrooms', 0),
             'enquiry_max_price':  enquiry.get('max_price', 0),
             'enquiry_prop_type':  enquiry.get('prop_type', 'Any property type'),
             'scraped_listings':   json.dumps(listings),
             'created_at':         datetime.now().isoformat(),
+            'updated_at':         datetime.now().isoformat(),
             'status':             'active'
         })
         print(f"[DYNAMO] Customer saved successfully")
@@ -243,8 +253,14 @@ def extract_enquiry_details(message: str) -> Dict:
                 {
                     "role": "system",
                     "content": """Extract property search details from the message.
-                    Return ONLY valid JSON with these keys:
-                    - postcode (string): the location to search — can be a full postcode (e.g. 'SW1A 1AA'), a postcode district (e.g. 'SE8', 'M4'), or a plain area name (e.g. 'Wimbledon', 'Essex', 'Greenwich'). Use whatever the user said as-is — do NOT try to convert area names into postcodes. Empty string if no location found.
+                    Return ONLY valid JSON with these exact keys:
+                    - contact_name (string): the person's name if mentioned, else empty string
+                    - email (string): email address if mentioned, else empty string
+                    - tags (array of strings): relevant tags e.g. ["first-time buyer", "investor", "upsizing", "downsizing", "relocation"] — infer from context, empty array if unclear
+                    - lead_intent (string): one of 'Buying', 'Renting', 'Investing', 'Unknown'
+                    - summary (string): a one-sentence summary of what the prospect is looking for
+                    - property_in_mind (string): any specific property or address they've mentioned, else empty string
+                    - postcode (string): the location to search — can be a full postcode (e.g. 'SW1A 1AA'), a postcode district (e.g. 'SE8', 'M4'), or a plain area name (e.g. 'Wimbledon', 'Essex', 'Greenwich'). Use whatever the user said as-is. Empty string if no location found.
                     - bedrooms (integer, 0 if not mentioned)
                     - max_price (integer, 0 if not mentioned, no commas)
                     - prop_type (string, one of: 'Any property type', 'Semi-detached house', 'Detached house', 'Flat', 'Bungalow', 'Cottage')
@@ -347,6 +363,125 @@ Guidelines:
 
 
 # ─────────────────────────────────────────────
+# CRM follow-up
+# ─────────────────────────────────────────────
+
+def get_missing_crm_fields(customer: Dict) -> List[str]:
+    """Return a list of CRM fields that are missing from the customer record."""
+    missing = []
+    if not customer.get('contact_name'):
+        missing.append('name')
+    if not customer.get('email'):
+        missing.append('email')
+    if not customer.get('lead_intent') or customer.get('lead_intent') == 'Unknown':
+        missing.append('intent')
+    return missing
+
+
+def build_crm_followup_message(missing_fields: List[str]) -> Optional[str]:
+    """Build a natural follow-up SMS asking for missing CRM info."""
+    if not missing_fields:
+        return None
+
+    asks = []
+    if 'name' in missing_fields:
+        asks.append("your name")
+    if 'email' in missing_fields:
+        asks.append("your email address")
+    if 'intent' in missing_fields:
+        asks.append("whether you're looking to buy for yourself or as an investment")
+
+    if len(asks) == 1:
+        ask_str = asks[0]
+    elif len(asks) == 2:
+        ask_str = f"{asks[0]} and {asks[1]}"
+    else:
+        ask_str = ", ".join(asks[:-1]) + f", and {asks[-1]}"
+
+    return f"One quick thing — could you share {ask_str}? It helps me find you the best options. 😊"
+
+
+def extract_crm_reply(message: str, missing_fields: List[str]) -> Dict:
+    """Use GPT to extract CRM field values from the user's reply to the follow-up question."""
+    print(f"[OPENAI] Extracting CRM reply for missing fields: {missing_fields}")
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            max_tokens=200,
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"""The user was asked to provide: {', '.join(missing_fields)}.
+Extract these values from their reply and return ONLY valid JSON with these keys (use empty string if not found):
+- contact_name (string)
+- email (string)
+- lead_intent (string): one of 'Buying', 'Renting', 'Investing', 'Unknown'"""
+                },
+                {"role": "user", "content": message}
+            ]
+        )
+        text = re.sub(r'```json|```', '', response.choices[0].message.content.strip()).strip()
+        parsed = json.loads(text)
+        print(f"[OPENAI] Extracted CRM reply: {parsed}")
+        return parsed
+    except Exception as e:
+        print(f"[OPENAI] ERROR in extract_crm_reply: {e}")
+        return {}
+
+
+def update_customer_crm(phone: str, crm_data: Dict):
+    """Update only the CRM fields on an existing customer record without touching listings."""
+    print(f"[DYNAMO] Updating CRM fields for {phone}: {crm_data}")
+    try:
+        parts = []
+        # Use ExpressionAttributeNames for ALL fields since 'name' and 'email'
+        # are reserved words in DynamoDB
+        expr_names  = {
+            '#contact_name': 'contact_name',
+            '#email':        'email',
+            '#lead_intent':  'lead_intent',
+            '#updated_at':   'updated_at',
+        }
+        expr_values = {
+            ':updated_at': datetime.now().isoformat()
+        }
+
+        if crm_data.get('contact_name') and crm_data['contact_name'] != 'Unknown':
+            parts.append('#contact_name = :contact_name')
+            expr_values[':contact_name'] = crm_data['contact_name']
+
+        if crm_data.get('email') and crm_data['email'] != 'Unknown':
+            parts.append('#email = :email')
+            expr_values[':email'] = crm_data['email']
+
+        if crm_data.get('lead_intent') and crm_data['lead_intent'] not in ('Unknown', ''):
+            parts.append('#lead_intent = :lead_intent')
+            expr_values[':lead_intent'] = crm_data['lead_intent']
+
+        if not parts:
+            print("[DYNAMO] No CRM fields to update")
+            return
+
+        parts.append('#updated_at = :updated_at')
+        update_expr = "SET " + ", ".join(parts)
+
+        print(f"[DYNAMO] UpdateExpression: {update_expr}")
+        print(f"[DYNAMO] ExpressionAttributeValues: {expr_values}")
+
+        customers_table.update_item(
+            Key={'customer_id': phone},
+            UpdateExpression=update_expr,
+            ExpressionAttributeNames=expr_names,
+            ExpressionAttributeValues=expr_values
+        )
+        print(f"[DYNAMO] CRM fields updated successfully")
+    except Exception as e:
+        print(f"[DYNAMO] ERROR in update_customer_crm: {e}")
+        import traceback
+        print(traceback.format_exc())
+
+
+# ─────────────────────────────────────────────
 # Send SMS directly via Twilio API
 # ─────────────────────────────────────────────
 
@@ -379,40 +514,123 @@ def twiml_response(messages):
 
 
 def parse_body(event):
-    print(f"[PARSE] Raw event body: {str(event.get('body', ''))[:300]}")
     raw = event.get('body', '')
     if event.get('isBase64Encoded'):
         import base64
         raw = base64.b64decode(raw).decode('utf-8')
-        print(f"[PARSE] Decoded base64 body: {raw[:300]}")
-    params = dict(p.split('=', 1) for p in raw.split('&') if '=' in p)
-    from urllib.parse import unquote_plus
-    result = {
-        'body': unquote_plus(params.get('Body', '')),
-        'from': unquote_plus(params.get('From', ''))
-    }
+    else:
+        print("Not Base64 Encoded")
+        return(event.body)
+    content_type = ''
+    headers = event.get('headers', {})
+    for key in headers:
+        if key.lower() == 'content-type':
+            content_type = headers[key]
+            break
+
+    # Multipart form data
+    if 'multipart/form-data' in content_type:
+        import re
+        boundary = re.search(r'boundary=([^\s;]+)', content_type)
+        if boundary:
+            boundary_str = boundary.group(1)
+            fields = {}
+            parts = raw.split('--' + boundary_str)
+            for part in parts:
+                if 'Content-Disposition' in part:
+                    match = re.search(r'name="([^"]+)"\s*\r?\n\r?\n(.*)', part, re.DOTALL)
+                    if match:
+                        fields[match.group(1)] = match.group(2).strip()
+            result = {
+                'body': fields.get('message', ''),
+                'from': fields.get('phone', '')
+            }
+        else:
+            result = {'body': '', 'from': ''}
+
+    # URL-encoded form data (original path)
+    else:
+        from urllib.parse import unquote_plus
+        params = dict(p.split('=', 1) for p in raw.split('&') if '=' in p)
+        result = {
+            'body': unquote_plus(params.get('Body', '')),
+            'from': unquote_plus(params.get('From', ''))
+        }
+
     print(f"[PARSE] Parsed -> from={result['from']} | body={result['body']}")
     return result
-
-
 # ─────────────────────────────────────────────
 # Lambda handler
 # ─────────────────────────────────────────────
 
 def handler(event, context):
     print(f"[HANDLER] Invoked. Event keys: {list(event.keys())}")
-
+    print("event:", event)
+    #______________________________________________
     # Health check
+    #______________________________________________
     if event.get('requestContext', {}).get('http', {}).get('method') == 'GET':
         print(f"[HANDLER] Health check request")
         return {'statusCode': 200, 'body': 'Property bot is running ✅'}
+    
+    if event.get('isBase64Encoded') == False:
+        print(f"[HANDLER] Not base64 encoded, using body directly")
+        parsed = event.get("body")
+        parsed = json.loads(parsed)
+        phone = parsed.get("phone")
+        message = parsed.get("message")
+        print(f"[HANDLER] Parsed -> from={phone} | body={message}")
+    else:
+        parsed  = parse_body(event)
+        phone   = parsed['from']
+        print("")
+        message = parsed['body'].strip()
 
-    parsed  = parse_body(event)
-    phone   = parsed['from']
-    message = parsed['body'].strip()
+   
+
 
     print(f"[HANDLER] phone={phone!r} | message={message!r}")
 
+    # ─────────────────────────────────────────────
+    # Manual send route — POST /send
+    # ─────────────────────────────────────────────
+    path = event.get('requestContext', {}).get('http', {}).get('path', '')
+    if path == '/send':
+        print(f"[HANDLER] Manual send route triggered")
+        try:
+            print(f"[HANDLER] Manual send | phone={phone!r} | message={message!r}")
+
+            if not phone or not message:
+                return {
+                    'statusCode': 400,
+                    'body': json.dumps({'error': 'phone and message are required'})
+                }
+
+            send_sms(phone, message)
+            save_message(phone, 'assistant', message)
+
+            print(f"[HANDLER] Manual send complete to {phone}")
+            return {
+                'statusCode': 200,
+                'headers': {
+                    'Access-Control-Allow-Origin': '*',  # or your specific Replit URL
+                    'Access-Control-Allow-Headers': 'Content-Type',
+                    'Access-Control-Allow-Methods': 'POST, OPTIONS'
+                },
+                'body': json.dumps({'success': True, 'phone': phone, 'message': message})
+            }
+
+        except Exception as e:
+            print(f"[HANDLER] ERROR in manual send: {e}")
+            import traceback
+            print(traceback.format_exc())
+            return {
+                'statusCode': 500,
+                'body': json.dumps({'error': 'Internal server error'})
+            }
+    # ─────────────────────────────────────────────
+    # Automatic AI response to SMS messages
+    # ─────────────────────────────────────────────
     if not phone:
         print(f"[HANDLER] ERROR: Empty phone number, cannot proceed")
         return {
@@ -486,6 +704,15 @@ def handler(event, context):
             reply = get_ai_response(phone, intro_prompt, listings)
             save_message(phone, 'assistant', reply)
             send_sms(phone, reply)
+
+            # ── Send CRM follow-up if info is missing ──
+            missing = get_missing_crm_fields(enquiry)
+            followup = build_crm_followup_message(missing)
+            if followup:
+                print(f"[HANDLER] Sending CRM follow-up for missing fields: {missing}")
+                save_message(phone, 'assistant', followup)
+                send_sms(phone, followup)
+
             return {
                 'statusCode': 200,
                 'headers': {'Content-Type': 'text/xml'},
@@ -496,6 +723,30 @@ def handler(event, context):
             print(f"[HANDLER] Returning customer flow")
             save_message(phone, 'user', message)
             current_postcode = customer.get('enquiry_postcode', '')
+
+            # ── Check if user is replying to CRM follow-up ──
+            missing = get_missing_crm_fields(customer)
+            if missing:
+                crm_data = extract_crm_reply(message, missing)
+                if any(crm_data.get(f) for f in ['contact_name', 'email', 'lead_intent']):
+                    print(f"[HANDLER] CRM reply detected, updating fields: {crm_data}")
+                    update_customer_crm(phone, crm_data)
+                    # Check if anything is still missing after this update
+                    updated_customer = {**customer, **crm_data}
+                    still_missing = get_missing_crm_fields(updated_customer)
+                    if still_missing:
+                        followup = build_crm_followup_message(still_missing)
+                        save_message(phone, 'assistant', followup)
+                        send_sms(phone, followup)
+                    else:
+                        thanks = "Thanks, I've got all your details! Feel free to ask me anything about the listings. 😊"
+                        save_message(phone, 'assistant', thanks)
+                        send_sms(phone, thanks)
+                    return {
+                        'statusCode': 200,
+                        'headers': {'Content-Type': 'text/xml'},
+                        'body': '<Response></Response>'
+                    }
 
             # Check if user is asking to search a new area
             detection = detect_new_search(message, current_postcode)
@@ -538,6 +789,15 @@ def handler(event, context):
                 reply = get_ai_response(phone, intro_prompt, listings)
                 save_message(phone, 'assistant', reply)
                 send_sms(phone, reply)
+
+                # Re-check CRM follow-up in case still missing
+                updated_customer = get_customer(phone) or customer
+                still_missing = get_missing_crm_fields(updated_customer)
+                followup = build_crm_followup_message(still_missing)
+                if followup:
+                    save_message(phone, 'assistant', followup)
+                    send_sms(phone, followup)
+
                 return {
                     'statusCode': 200,
                     'headers': {'Content-Type': 'text/xml'},
