@@ -1,0 +1,187 @@
+import os
+import json
+import re
+from typing import Dict, List, Optional
+import requests
+from bs4 import BeautifulSoup
+
+SCRAPE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.5",
+    "Connection": "keep-alive",
+}
+
+# ─────────────────────────────────────────────
+# Scraper
+# ─────────────────────────────────────────────
+
+def extract_postcode(address: str) -> Optional[str]:
+    match = re.search(r'\b([A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2})\b', address.upper())
+    return match.group(1) if match else None
+
+
+def build_search_url(postcode: str, max_price: int, min_beds: int, prop_type: str, radius: float = 4) -> str:
+    from urllib.parse import quote_plus
+    location = postcode.strip()
+    if re.match(r'^[A-Za-z]{1,2}\d', location):
+        location = location.upper().replace(' ', '')
+    else:
+        location = quote_plus(location)
+    url = f"https://exp.uk.com/properties-for-sale/results/?action=search&location={location}&search_radii={radius}"
+
+    url += f"&max-price={max_price}" if max_price > 0 else "&max-price=0"
+
+    prop_type_map = {
+        "any property type": "0",
+        "semi-detached house": "3",
+        "detached house": "4",
+        "flat": "6",
+        "bungalow": "8",
+        "cottage": "10"
+    }
+    url += f"&property-type={prop_type_map.get(prop_type.lower(), '0')}"
+    url += f"&min-bedrooms={min_beds if min_beds < 6 else 0}"
+    return url
+
+
+def scrape_exp(postcode: str, max_price: int = 0, min_beds: int = 0, prop_type: str = "Any property type", radius: float = 4) -> List[Dict]:
+    url = build_search_url(postcode, max_price, min_beds, prop_type, radius)
+    print(f"[SCRAPER] Built URL: {url}")
+
+    try:
+        print(f"[SCRAPER] Sending HTTP request...")
+        response = requests.get(url, headers=SCRAPE_HEADERS, timeout=15)
+        print(f"[SCRAPER] Response status: {response.status_code}")
+        response.raise_for_status()
+    except requests.exceptions.Timeout:
+        print(f"[SCRAPER] ERROR: Request timed out after 15s")
+        return []
+    except requests.exceptions.HTTPError as e:
+        print(f"[SCRAPER] ERROR: HTTP error {e.response.status_code}: {e}")
+        return []
+    except requests.exceptions.RequestException as e:
+        print(f"[SCRAPER] ERROR: Request failed: {e}")
+        return []
+
+    try:
+        soup = BeautifulSoup(response.text, 'html.parser')
+        print(f"[SCRAPER] Page parsed, searching for aProperties...")
+
+        aProperties = []
+        for script in soup.find_all('script'):
+            if script.string and 'aProperties' in script.string:
+                match = re.search(r'const aProperties = (\[.*?\]);', script.string, re.DOTALL)
+                if match:
+                    aProperties = json.loads(match.group(1))
+                    print(f"[SCRAPER] Found aProperties block with {len(aProperties)} items")
+
+        if not aProperties:
+            print(f"[SCRAPER] No aProperties found in page scripts")
+            return []
+
+        results = []
+        for p in aProperties:
+            try:
+                price_text = BeautifulSoup(p['html_price'], 'html.parser').get_text()
+                price_match = re.search(r'£[\d,]+', price_text)
+                type_match = re.search(r'\d+\s*bedroom[s]?\s+(.+)', p['description'], re.IGNORECASE)
+                prop_type_clean = type_match.group(1).strip() if type_match else "Unknown"
+                postcode_clean = extract_postcode(p['display_address']) or ''
+
+                results.append({
+                    'address':       p['display_address'],
+                    'status':        "For Sale" if p['status_code'] == 2 else "Sold STC",
+                    'price':         price_match.group(0) if price_match else 'POA',
+                    'postcode':      postcode_clean,
+                    'bedrooms':      p['bedrooms'],
+                    'bathrooms':     p['bathrooms'],
+                    'receptions':    p['receptionrooms'],
+                    'property_type': prop_type_clean,
+                    'agent_name':    p['agent_name'],
+                    'agent_phone':   p['agent_phone'],
+                    'agent_email':   p['agent_email'],
+                    'url':           "https://exp.uk.com" + p['property_url_part'],
+                })
+            except Exception as e:
+                print(f"[SCRAPER] WARNING: Skipping malformed property entry: {e}")
+                continue
+
+        print(f"[SCRAPER] Returning {len(results)} properties")
+        return results
+
+    except Exception as e:
+        print(f"[SCRAPER] ERROR parsing page content: {e}")
+        return []
+
+def find_specific_agent_listing_from_loop_postcode(postcode: str, max_price: int = 0, min_beds: int = 0, prop_type: str = "Any property type", radius: float = 4) -> Dict:
+    url = build_search_url(postcode, max_price, min_beds, prop_type, radius)
+    print(f"[SCRAPER] Built URL: {url}")
+
+    try:
+        print(f"[SCRAPER] Sending HTTP request...")
+        response = requests.get(url, headers=SCRAPE_HEADERS, timeout=15)
+        print(f"[SCRAPER] Response status: {response.status_code}")
+        response.raise_for_status()
+    except requests.exceptions.Timeout:
+        print(f"[SCRAPER] ERROR: Request timed out after 15s")
+        return {}
+    except requests.exceptions.HTTPError as e:
+        print(f"[SCRAPER] ERROR: HTTP error {e.response.status_code}: {e}")
+        return {}
+    except requests.exceptions.RequestException as e:
+        print(f"[SCRAPER] ERROR: Request failed: {e}")
+        return {}
+
+    try:
+        soup = BeautifulSoup(response.text, 'html.parser')
+        print(f"[SCRAPER] Page parsed, searching for aProperties...")
+
+        aProperties = []
+        for script in soup.find_all('script'):
+            if script.string and 'aProperties' in script.string:
+                match = re.search(r'const aProperties = (\[.*?\]);', script.string, re.DOTALL)
+                if match:
+                    aProperties = json.loads(match.group(1))
+                    print(f"[SCRAPER] Found aProperties block with {len(aProperties)} items")
+
+        if not aProperties:
+            print(f"[SCRAPER] No aProperties found in page scripts")
+            return {}
+
+        for p in aProperties:
+            try:
+                if p.get('agent_email') == os.environ['SPECIFIC_AGENT_EMAIL']:
+                    print(f"Found Jeroen's property: {p['display_address']} - {p['html_price']}")
+                    
+                    price_text = BeautifulSoup(p['html_price'], 'html.parser').get_text()
+                    price_match = re.search(r'£[\d,]+', price_text)
+                    type_match = re.search(r'\d+\s*bedroom[s]?\s+(.+)', p['description'], re.IGNORECASE)
+                    prop_type_clean = type_match.group(1).strip() if type_match else "Unknown"
+                    postcode_clean = extract_postcode(p['display_address']) or ''
+
+                    result = {
+                        'address':       p['display_address'],
+                        'status':        "For Sale" if p['status_code'] == 2 else "Sold STC",
+                        'price':         price_match.group(0) if price_match else 'POA',
+                        'postcode':      postcode_clean,
+                        'bedrooms':      p['bedrooms'],
+                        'bathrooms':     p['bathrooms'],
+                        'receptions':    p['receptionrooms'],
+                        'property_type': prop_type_clean,
+                        'agent_name':    p['agent_name'],
+                        'agent_phone':   p['agent_phone'],
+                        'agent_email':   p['agent_email'],
+                        'url':           "https://exp.uk.com" + p['property_url_part'],
+                    }
+
+            except Exception as e:
+                print(f"[SCRAPER] WARNING: Skipping malformed property entry: {e}")
+                continue
+
+        print(f"Results for Jeroen's properties: {result}")
+        return result
+
+    except Exception as e:
+        print(f"[SCRAPER] ERROR parsing page content: {e}")
+        return {}

@@ -1,0 +1,9 @@
+{
+  "requestContext": {
+    "http": {
+      "method": "POST",
+      "path": "/send"
+    }
+  },
+  "body": "{\"phone\": \"+447384058174\", \"message\": \"Test message from Lambda\"}"
+}
