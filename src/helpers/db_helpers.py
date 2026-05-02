@@ -6,9 +6,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 import boto3
 
-dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
-customers_table     = dynamodb.Table('Customers')
-conversations_table = dynamodb.Table('Conversations')
+from config import dynamodb, customers_table, conversations_table
 
 # ─────────────────────────────────────────────
 # DynamoDB helpers

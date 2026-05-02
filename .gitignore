@@ -245,5 +245,5 @@ $RECYCLE.BIN/
 
 # AWS SAM build artifacts and local testing files
 .aws-sam/
-samconfig.toml  # Optional: Keep it if it doesn't contain secrets, ignore if it does.
+samconfig.toml
 events/         # Often contains mock data; keep or ignore based on sensitivity.

@@ -1,13 +1,16 @@
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from xml.dom.minidom import Attr
 
-from openai_helpers import enquire_openai, extract_enquiry_details, detect_new_search, get_ai_response
-from scrape_helpers import scrape_exp, find_specific_agent_listing_from_loop_postcode
-from crm_helpers import get_missing_crm_fields, build_crm_followup_message, extract_crm_reply, parse_loop_enquiry
-from db_helpers import customers_table, get_customer, save_customer, save_message, reset_customer
-from twilio_helpers import send_sms, twiml_response, parse_send_message_body
-from general_helpers import format_scraped_properties_into_listings_message
+from helpers.openai_helpers import enquire_openai, extract_enquiry_details, detect_new_search, get_ai_response
+from helpers.scrape_helpers import scrape_exp, find_specific_agent_listing_from_loop_postcode, scrape_property_details_from_url
+from helpers.crm_helpers import get_missing_crm_fields, build_crm_followup_message, extract_crm_reply, parse_loop_enquiry
+from helpers.db_helpers import get_customer, save_customer, save_message, reset_customer
+from helpers.twilio_helpers import send_sms, twiml_response, parse_send_message_body
+from helpers.general_helpers import format_scraped_properties_into_listings_message
+
+from config import dynamodb, customers_table, conversations_table
 # ─────────────────────────────────────────────
 # Setup
 # ─────────────────────────────────────────────
@@ -24,11 +27,34 @@ import os
 def handler(event, context):
     print(f"[HANDLER] Invoked. Event keys: {list(event.keys())}")
     print("event:", event)
+    print("[HANDLER] Version includes Unit Testing logic and First Message Endpoint.")
     
     path = event.get('requestContext', {}).get('http', {}).get('path', '')
     phone = None
     message = None
 
+    #______________________________________________
+    # Unit Testing
+    #______________________________________________
+    if event.get("localUnitTesting", False):
+        print(f"[HANDLER] Unit testing mode")
+        property_listing = event.get("url", "")
+        print(f"[HANDLER] Testing scrape_property_details_from_url with URL: {property_listing}")
+        try:
+            details = scrape_property_details_from_url(property_listing)
+            print(f"[HANDLER] Scraped details: {details}")
+            return {
+                'statusCode': 200,
+                'body': json.dumps({'success': True, 'details': details})
+            }
+        except Exception as e:
+            import traceback
+            print(f"[HANDLER] ERROR in unit test scrape: {e}")
+            print(traceback.format_exc())
+            return {
+                'statusCode': 500,
+                'body': json.dumps({'success': False, 'error': str(e)})
+            }
     #______________________________________________
     # Health check
     #______________________________________________
@@ -117,7 +143,9 @@ def handler(event, context):
             print("Native Loop Enquiry Details:", enquiry_details)
 
             # Tidying up phone number and email and other keys
-            personal_phone = enquiry_details['Phone Evening']
+            personal_phone = enquiry_details['Phone Daytime'] if enquiry_details.get('Phone Daytime') else enquiry_details.get('Phone Evening', '')
+            if personal_phone == "N/A" or personal_phone.strip() == "":
+                return({'statusCode': 400, 'body': json.dumps({'error': 'Phone number missing'})})
             raw_email = enquiry_details["Email Address"]
             try:
                 email = raw_email.split("[")[1].split("]")[0]
@@ -158,23 +186,18 @@ def handler(event, context):
 
             # All details are extracted from their enquiry. Send them a first message.
 
-            greet_user_message = f"Hi {enquiry_details['First Name']}! I’m Chloe from EXP. I see you enquired about {enquiry_details['Address']}. How are you doing today?"
+            greet_user_message = f"Hi {enquiry_details['First Name']}! I’m Chloe from EXP. How are you doing today?"
             send_first_message = send_sms(enquiry_details['customer_id'], greet_user_message)
             save_message(enquiry_details['customer_id'], 'assistant', greet_user_message)
 
+            book_viewing_message = f"I see you enquired about {enquiry_details['Address']}. When would you be free over the next week? We could arrange for a viewing for the property?"
+            send_viewing_message = send_sms(enquiry_details['customer_id'], book_viewing_message)
+            save_message(enquiry_details['customer_id'], 'assistant', book_viewing_message)
+
             # Send them the list of similar properties we found
-            listing_message = format_scraped_properties_into_listings_message(listings, 5)
-            send_sms(enquiry_details['customer_id'], listing_message)
-            save_message(enquiry_details['customer_id'], 'assistant', listing_message)
-
-            # properties = json.loads(enquiry_details['scraped_listings'])[:5]
-            # print(f"[HANDLER] Getting AI to list properties...")
-            # ai_prompt = f"Say that below is a list of properties you think they might be interested in. List ALL {len(properties)} properties you found with their address, price, bed count, type, and URL. Do not summarise — list every single one."
-            # reply = get_ai_response(enquiry_details['customer_id'], ai_prompt, properties)
-            # print(f"[HANDLER] Sending the list of properties...")
-            # send_sms(enquiry_details['customer_id'], reply)
-            # save_message(enquiry_details['customer_id'], 'assistant', reply)
-
+            # listing_message = format_scraped_properties_into_listings_message(listings, 5)
+            # send_sms(enquiry_details['customer_id'], listing_message)
+            # save_message(enquiry_details['customer_id'], 'assistant', listing_message)
 
             return {
                 'statusCode': 200,
@@ -198,6 +221,124 @@ def handler(event, context):
                 'body': json.dumps({'error': 'Internal server error'})
             }
 
+    # ─────────────────────────────────────────────
+    # /daily-check — Re-engage inactive customers
+    # ─────────────────────────────────────────────
+    if path == '/daily-check':
+        print(f"[HANDLER] Daily customer check triggered")
+        
+        try:
+            now = datetime.now(timezone.utc)
+            cutoff = now - timedelta(days=14)
+            reengaged = []
+            skipped = []
+
+            # Scan all customers that are still active
+            customers_response = customers_table.scan(
+                FilterExpression=('#st = :st'),
+                ExpressionAttributeNames={'#st': 'status'},
+                ExpressionAttributeValues={':st': 'active'}
+            )
+            customers = customers_response.get('Items', [])
+            print(f"[HANDLER] Found {len(customers)} customers to check")
+
+            for customer in customers:
+                customer_id = customer.get('customer_id') #customer_id is the phone number in the customers table
+                contact_name = customer.get('contact_name') or customer.get('First Name', 'there')
+                print(f"[HANDLER] Checking customer {customer_id} ({contact_name})")
+
+                if not customer_id:
+                    print(f"[HANDLER] Skipping customer with no customer_id")
+                    continue
+
+                # Get latest message from Conversations table for this customer
+                conversations_response = conversations_table.query(
+                    IndexName='phone_number-timestamp-index',
+                    KeyConditionExpression='phone_number = :pn',
+                    ExpressionAttributeValues={':pn': customer_id},
+                    ScanIndexForward=False,  # newest first
+                    Limit=1
+                )
+                messages = conversations_response.get('Items', [])
+
+                if not messages:
+                    print(f"[HANDLER] No messages found for {customer_id}, skipping")
+                    skipped.append(customer_id)
+                    continue
+
+                latest_message = messages[0]
+                latest_timestamp_str = latest_message.get('timestamp')
+                print(f"[HANDLER] Latest message for {customer_id}: {messages[0]['message'] if messages else 'No messages found'} at {latest_timestamp_str}")
+
+
+                if not latest_timestamp_str:
+                    print(f"[HANDLER] No timestamp on latest message for {customer_id}, skipping")
+                    skipped.append(customer_id)
+                    continue
+
+                latest_timestamp = datetime.fromisoformat(latest_timestamp_str).replace(tzinfo=timezone.utc)
+                days_since = (now - latest_timestamp).days
+                print(f"[HANDLER] {customer_id} — last active {days_since} days ago")
+
+                if latest_timestamp < cutoff:
+                    print(f"[HANDLER] {customer_id} is inactive for more than 14 days, re-engaging")
+                    reengaged.append(customer_id)
+
+                    # Scrape again any new properties based on their original enquiry details and update their record in the DB with the new list of properties
+                    # Text them this new list of properties to reengage them and see if they're interested in any of the new ones
+                    listings = scrape_exp(
+                        postcode=customer.get('enquiry_postcode', ''),
+                        max_price=customer.get('enquiry_max_price'), #just assume that their max budget is the current enquired property price upwards of 20%
+                        min_beds=customer.get('enquiry_bedrooms', 0),
+                        prop_type=customer.get('enquiry_prop_type', 'Any property type')
+                    )
+                    rejected = set(customer.get("rejected_listings", []))
+                    listings = [l for l in listings if l.get("url") not in rejected]
+                    print(f"[HANDLER] Scraped {len(listings)} properties for re-engagement of {customer_id} (after filtering rejected)")
+                    print(f"[HANDLER] Sample scraped property for {customer_id}: {listings[0] if listings else 'No properties found'}")
+
+                    customers_table.update_item(
+                        Key={'customer_id': customer_id},
+                        UpdateExpression='SET #sl = :sl',
+                        ExpressionAttributeNames={'#sl': 'scraped_listings'},
+                        ExpressionAttributeValues={':sl': json.dumps(listings)}
+                    )
+
+                    # All details are extracted from their enquiry. Send them a first message.
+                    message = f"Hi {contact_name}, just checking in — how are you doing? Still on the lookout for a property?"
+                    send_sms(customer_id, message)
+                    save_message(customer_id, 'assistant', message)
+
+                    # Send them the list of similar properties we found
+                    listing_message = format_scraped_properties_into_listings_message(listings, 3)
+                    print("[HANDLER] Re-engagement listing message:", listing_message)
+                    send_sms(customer_id, listing_message)
+                    save_message(customer_id, 'assistant', listing_message)
+                    print(f"[HANDLER] Re-engaged {customer_id}")
+
+                else:
+                    skipped.append(customer_id)
+                    print(f"[HANDLER] {customer_id} is still active, skipping")
+
+            print(f"[HANDLER] Daily check complete. Re-engaged: {len(reengaged)}, Skipped: {len(skipped)}")
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'success': True,
+                    'date_checked': now.isoformat(),
+                    'reengaged': reengaged,
+                    'skipped': skipped
+                })
+            }
+
+        except Exception as e:
+            print(f"[HANDLER] ERROR in daily check: {e}")
+            import traceback
+            print(traceback.format_exc())
+            return {
+                'statusCode': 500,
+                'body': json.dumps({'error': 'Internal server error'})
+            }
 
     # ─────────────────────────────────────────────
     # Automatic AI response to SMS messages
@@ -209,11 +350,11 @@ def handler(event, context):
             return {
                 'statusCode': 200,
                 'headers': {'Content-Type': 'text/xml'},
-                'body': twiml_response("Could not identify your phone number.")
+                'body': twiml_response("Hi sorry we could not identify your phone number. No response will be made.")
             }
 
         # Handle reset
-        if message.lower() == 'reset':
+        if message and message.lower() == 'reset':
             print(f"[HANDLER] Reset requested by {phone}")
             reset_customer(phone)
             return {
@@ -229,173 +370,46 @@ def handler(event, context):
             if not customer:
                 print(f"[HANDLER] New customer flow")
                 save_message(phone, 'user', message)
-
-                # Immediately acknowledge so Twilio doesn't time out
-                ack = "Got it! Searching for properties now, I'll send you the results in a moment... 🏡"
-                save_message(phone, 'assistant', ack)
-                send_sms(phone, ack)
-
-                print(f"[HANDLER] Extracting enquiry details...")
-                enquiry = extract_enquiry_details(message)
-                logger.info(f"Extracted enquiry: {enquiry}")
-
-                if not enquiry.get('postcode'):
-                    print(f"[HANDLER] No postcode found, asking user")
-                    reply = "Hi! I'm your property assistant. Please send me your enquiry including the postcode or area, number of bedrooms, and budget. E.g. 'Looking for a 2 bed flat in M4 under £250,000'"
-                    save_message(phone, 'assistant', reply)
-                    send_sms(phone, reply)
-                    return {
-                        'statusCode': 200,
-                        'headers': {'Content-Type': 'text/xml'},
-                        'body': '<Response></Response>'
-                    }
-
-                print(f"[HANDLER] Scraping listings for postcode={enquiry['postcode']}...")
-                listings = scrape_exp(
-                    postcode=enquiry['postcode'],
-                    max_price=enquiry.get('max_price', 0),
-                    min_beds=enquiry.get('bedrooms', 0),
-                    prop_type=enquiry.get('prop_type', 'Any property type')
+                enquiry = {
+                    'created_at': datetime.now().isoformat(),
+                    'updated_at': datetime.now().isoformat(),
+                    'status': 'active'
+                }
+                save_customer(
+                    phone=phone,
+                    enquiry=enquiry,
+                    listings=[]
                 )
 
-                if not listings:
-                    print(f"[HANDLER] No listings found")
-                    reply = f"I searched for properties in {enquiry['postcode']} but couldn't find any matching results. Could you try a different postcode or broaden your criteria?"
-                    save_message(phone, 'assistant', reply)
-                    send_sms(phone, reply)
-                    return {
-                        'statusCode': 200,
-                        'headers': {'Content-Type': 'text/xml'},
-                        'body': '<Response></Response>'
-                    }
-
-                print(f"[HANDLER] Saving customer and {len(listings)} listings...")
-                save_customer(phone, enquiry, listings)
-
-                print(f"[HANDLER] Getting AI intro response...")
-                intro_prompt = f"Introduce yourself briefly, then list ALL {len(listings)} properties you found with their address, price, bed count, type, and URL. Do not summarise — list every single one."
-                reply = get_ai_response(phone, intro_prompt, listings)
-                save_message(phone, 'assistant', reply)
-                send_sms(phone, reply)
-
-                # ── Send CRM follow-up if info is missing ──
-                missing = get_missing_crm_fields(enquiry)
-                followup = build_crm_followup_message(missing)
-                if followup:
-                    print(f"[HANDLER] Sending CRM follow-up for missing fields: {missing}")
-                    save_message(phone, 'assistant', followup)
-                    send_sms(phone, followup)
-
-                return {
-                    'statusCode': 200,
-                    'headers': {'Content-Type': 'text/xml'},
-                    'body': '<Response></Response>'
-                }
+                print(f"[HANDLER] No existing customer found with phone {phone}. Starting new customer flow by asking for enquiry details.")
+                # Immediately acknowledge so Twilio doesn't time out
+                ack = "Hi there! I'm Chloe from EXP. How are you doing today? \n\n Just so I can help you better, can you tell me what type of property you're looking for?"
+                send_sms(phone, ack)                
+                save_message(phone, 'assistant', ack)
+                # Ask for the enquiry details we need to find properties for them and save to CRM before we do anything else
+                # get_customer_info = ""
+                # send_sms(phone, get_customer_info)
+                # save_message(phone, 'assistant', get_customer_info)
 
             else:
                 print(f"[HANDLER] Returning customer flow")
                 save_message(phone, 'user', message)
-                current_postcode = customer.get('enquiry_postcode', '')
+                reply = get_ai_response(phone, message)
+                send_sms(phone, reply)
+                save_message(phone, 'assistant', reply)
 
-                # ── Check if user is replying to CRM follow-up ──
-                missing = get_missing_crm_fields(customer)
-                if missing:
-                    crm_data = extract_crm_reply(message, missing)
-                    if any(crm_data.get(f) for f in ['contact_name', 'email', 'lead_intent']):
-                        print(f"[HANDLER] CRM reply detected, updating fields: {crm_data}")
-                        update_customer_crm(phone, crm_data)
-                        # Check if anything is still missing after this update
-                        updated_customer = {**customer, **crm_data}
-                        still_missing = get_missing_crm_fields(updated_customer)
-                        if still_missing:
-                            followup = build_crm_followup_message(still_missing)
-                            save_message(phone, 'assistant', followup)
-                            send_sms(phone, followup)
-                        else:
-                            thanks = "Thanks, I've got all your details! Feel free to ask me anything about the listings. 😊"
-                            save_message(phone, 'assistant', thanks)
-                            send_sms(phone, thanks)
-                        return {
-                            'statusCode': 200,
-                            'headers': {'Content-Type': 'text/xml'},
-                            'body': '<Response></Response>'
-                        }
+            # if len(reply) <= 1600:
+            #     sms_messages = [reply]
+            # else:
+            #     chunks = [reply[i:i+1550] for i in range(0, len(reply), 1550)]
+            #     sms_messages = [f"({i+1}/{len(chunks)}) {chunk}" for i, chunk in enumerate(chunks)]
 
-                # Check if user is asking to search a new area
-                detection = detect_new_search(message, current_postcode)
-
-                if detection.get('new_search') and detection.get('postcode'):
-                    new_postcode = detection['postcode']
-                    print(f"[HANDLER] New area requested: {new_postcode}")
-
-                    ack = f"Sure! Searching for properties in {new_postcode} now... 🏡"
-                    save_message(phone, 'assistant', ack)
-                    send_sms(phone, ack)
-
-                    listings = scrape_exp(
-                        postcode=new_postcode,
-                        max_price=detection.get('max_price', 0),
-                        min_beds=detection.get('bedrooms', 0),
-                        prop_type=detection.get('prop_type', 'Any property type')
-                    )
-
-                    if not listings:
-                        reply = f"I searched in {new_postcode} but couldn't find any matching results. Try a different area or broaden your criteria?"
-                        save_message(phone, 'assistant', reply)
-                        send_sms(phone, reply)
-                        return {
-                            'statusCode': 200,
-                            'headers': {'Content-Type': 'text/xml'},
-                            'body': '<Response></Response>'
-                        }
-
-                    enquiry = {
-                        'postcode':  new_postcode,
-                        'bedrooms':  detection.get('bedrooms', customer.get('enquiry_bedrooms', 0)),
-                        'max_price': detection.get('max_price', customer.get('max_price', 0)),
-                        'prop_type': detection.get('prop_type', customer.get('enquiry_prop_type', 'Any property type')),
-                    }
-                    save_customer(phone, enquiry, listings)
-                    print(f"[HANDLER] Updated customer with {len(listings)} new listings for {new_postcode}")
-
-                    intro_prompt = f"The user asked to search a new area: {new_postcode}. List ALL {len(listings)} properties found with address, price, bed count, type, and URL. Do not summarise — list every single one."
-                    reply = get_ai_response(phone, intro_prompt, listings)
-                    save_message(phone, 'assistant', reply)
-                    send_sms(phone, reply)
-
-                    # Re-check CRM follow-up in case still missing
-                    updated_customer = get_customer(phone) or customer
-                    still_missing = get_missing_crm_fields(updated_customer)
-                    followup = build_crm_followup_message(still_missing)
-                    if followup:
-                        save_message(phone, 'assistant', followup)
-                        send_sms(phone, followup)
-
-                    return {
-                        'statusCode': 200,
-                        'headers': {'Content-Type': 'text/xml'},
-                        'body': '<Response></Response>'
-                    }
-
-                else:
-                    # Normal follow-up question about existing listings
-                    listings = json.loads(customer.get('scraped_listings', '[]'))
-                    print(f"[HANDLER] Loaded {len(listings)} listings from customer record")
-                    reply = get_ai_response(phone, message, listings)
-
-            save_message(phone, 'assistant', reply)
-
-            if len(reply) <= 1600:
-                sms_messages = [reply]
-            else:
-                chunks = [reply[i:i+1550] for i in range(0, len(reply), 1550)]
-                sms_messages = [f"({i+1}/{len(chunks)}) {chunk}" for i, chunk in enumerate(chunks)]
-
-            print(f"[HANDLER] Sending {len(sms_messages)} SMS message(s)")
+            # print(f"[HANDLER] Sending {len(sms_messages)} SMS message(s)")
             return {
                 'statusCode': 200,
                 'headers': {'Content-Type': 'text/xml'},
-                'body': twiml_response(sms_messages)
+                #'body': f"Successfully processed message and sent reply." #twiml_response(sms_messages) --- IGNORE ---
+                'body': twiml_response("")
             }
 
         except Exception as e:

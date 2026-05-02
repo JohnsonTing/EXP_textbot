@@ -29,7 +29,6 @@ def build_search_url(postcode: str, max_price: int, min_beds: int, prop_type: st
     else:
         location = quote_plus(location)
     url = f"https://exp.uk.com/properties-for-sale/results/?action=search&location={location}&search_radii={radius}"
-
     url += f"&max-price={max_price}" if max_price > 0 else "&max-price=0"
 
     prop_type_map = {
@@ -114,6 +113,90 @@ def scrape_exp(postcode: str, max_price: int = 0, min_beds: int = 0, prop_type: 
         print(f"[SCRAPER] ERROR parsing page content: {e}")
         return []
 
+def scrape_property_details_from_url(property_url: str):
+    print(f"[SCRAPER] Scraping property details from URL: {property_url}")
+    response = requests.get(property_url, headers=SCRAPE_HEADERS, timeout=30)
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    # Grab the property-features section
+    property_features_sections = soup.find_all("section", id="property-features")
+    property_info_sections = soup.find_all("section", id="property-info")
+    property_description_sections = soup.find_all("section", id="property-details")
+    
+    # Log which sections were found and which were missing
+    sections = {
+        "property-features": property_features_sections,
+        "property-info": property_info_sections,
+        "property-details": property_description_sections,
+    }
+    missing = [name for name, section in sections.items() if not section]
+    if missing:
+        print(f"[SCRAPER] ERROR: Missing sections: {', '.join(missing)}")
+
+    # Initiate a dictionary to hold all the extracted details
+    total_property_details = {}
+
+    # PROPERTY FEATURES. Extract all list items from the overview ul
+    property_features = property_features_sections[0].find("ul", class_="overview") if property_features_sections else None
+    property_features_string = ""
+    if property_features:
+        items = property_features.find_all("li")
+        print(f"\nProperty Composition ({len(items)} items):")
+        for item in items:
+            text = item.get_text(strip=True)
+            property_features_string += text + "; "
+            if text:
+                print(f"  - {text}")
+        total_property_details["Property Composition"] = property_features_string
+
+    # PROPERTY INFO. Extract all list items from the features ul
+    property_info = property_info_sections[0].find("ul", class_="features") if property_info_sections else None
+    property_info_string = ""
+    if property_info:
+        info_items = property_info.find_all("li")
+        print(f"\nProperty Info ({len(info_items)} items):")
+        for item in info_items:
+            text = item.get_text(strip=True)
+            property_info_string += text + "; "
+            if text:
+                print(f"  - {text}")
+    total_property_details["Property Info"] = property_info_string
+
+    # PROPERTY DETAILS. Extract all list items from the description section
+    property_details = property_description_sections[0] if property_description_sections else None
+    property_description_string = ""
+    if property_details:
+        description_items = property_details.find_all("p")
+        print(f"\nProperty Description ({len(description_items)} items):")
+        for item in description_items:
+            text = item.get_text(strip=True)
+            property_description_string += text + "; "
+            if text:
+                print(f"  - {text}")
+    # Clean up the description string by removing duplicates and unnecessary parts                            
+    try:
+        property_description_string = property_description_string.encode('raw_unicode_escape').decode('utf-8')
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        pass
+
+    import re
+
+    # Split on semicolons, normalize whitespace, deduplicate
+    sentences = [re.sub(r'\s+', ' ', s).strip() for s in property_description_string.split(';') if s.strip()]
+    seen = []
+    for s in sentences:
+        if s not in seen:
+            seen.append(s)
+
+    property_description_string = ' '.join(seen).strip()
+    # Put the cleaned description back into the total details
+    total_property_details["Property Description"] = property_description_string
+
+    print(f"\nTotal extracted details: {total_property_details}")
+    return total_property_details
+
 def find_specific_agent_listing_from_loop_postcode(postcode: str, max_price: int = 0, min_beds: int = 0, prop_type: str = "Any property type", radius: float = 4) -> Dict:
     url = build_search_url(postcode, max_price, min_beds, prop_type, radius)
     print(f"[SCRAPER] Built URL: {url}")
@@ -149,6 +232,7 @@ def find_specific_agent_listing_from_loop_postcode(postcode: str, max_price: int
             print(f"[SCRAPER] No aProperties found in page scripts")
             return {}
 
+        result = {}
         for p in aProperties:
             try:
                 if p.get('agent_email') == os.environ['SPECIFIC_AGENT_EMAIL']:
@@ -185,3 +269,4 @@ def find_specific_agent_listing_from_loop_postcode(postcode: str, max_price: int
     except Exception as e:
         print(f"[SCRAPER] ERROR parsing page content: {e}")
         return {}
+

@@ -4,9 +4,9 @@ import re
 from typing import Dict, List, Optional
 import boto3
 from datetime import datetime
-from openai_helpers import openai_client
+from config import openai_client
 
-from db_helpers import customers_table, conversations_table
+from helpers.db_helpers import customers_table, conversations_table
 
 # ─────────────────────────────────────────────
 # CRM follow-up
@@ -75,56 +75,101 @@ Extract these values from their reply and return ONLY valid JSON with these keys
         return {}
 
 
-def update_customer_crm(phone: str, crm_data: Dict):
-    """Update only the CRM fields on an existing customer record without touching listings."""
-    print(f"[DYNAMO] Updating CRM fields for {phone}: {crm_data}")
-    try:
-        parts = []
-        # Use ExpressionAttributeNames for ALL fields since 'name' and 'email'
-        # are reserved words in DynamoDB
-        expr_names  = {
-            '#contact_name': 'contact_name',
-            '#email':        'email',
-            '#lead_intent':  'lead_intent',
-            '#updated_at':   'updated_at',
-        }
-        expr_values = {
-            ':updated_at': datetime.now().isoformat()
-        }
+# def update_customer_crm(phone: str, crm_data: Dict):
+#     """Update only the CRM fields on an existing customer record without touching listings."""
+#     print(f"[DYNAMO] Updating CRM fields for {phone}: {crm_data}")
+#     try:
+#         parts = []
+#         # Use ExpressionAttributeNames for ALL fields since 'name' and 'email'
+#         # are reserved words in DynamoDB
+#         expr_names  = {
+#             '#contact_name': 'contact_name',
+#             '#email':        'email',
+#             '#lead_intent':  'lead_intent',
+#             '#updated_at':   'updated_at',
+#         }
+#         expr_values = {
+#             ':updated_at': datetime.now().isoformat()
+#         }
 
-        if crm_data.get('contact_name') and crm_data['contact_name'] != 'Unknown':
-            parts.append('#contact_name = :contact_name')
-            expr_values[':contact_name'] = crm_data['contact_name']
+#         if crm_data.get('contact_name') and crm_data['contact_name'] != 'Unknown':
+#             parts.append('#contact_name = :contact_name')
+#             expr_values[':contact_name'] = crm_data['contact_name']
 
-        if crm_data.get('email') and crm_data['email'] != 'Unknown':
-            parts.append('#email = :email')
-            expr_values[':email'] = crm_data['email']
+#         if crm_data.get('email') and crm_data['email'] != 'Unknown':
+#             parts.append('#email = :email')
+#             expr_values[':email'] = crm_data['email']
 
-        if crm_data.get('lead_intent') and crm_data['lead_intent'] not in ('Unknown', ''):
-            parts.append('#lead_intent = :lead_intent')
-            expr_values[':lead_intent'] = crm_data['lead_intent']
+#         if crm_data.get('lead_intent') and crm_data['lead_intent'] not in ('Unknown', ''):
+#             parts.append('#lead_intent = :lead_intent')
+#             expr_values[':lead_intent'] = crm_data['lead_intent']
 
-        if not parts:
-            print("[DYNAMO] No CRM fields to update")
-            return
+#         if not parts:
+#             print("[DYNAMO] No CRM fields to update")
+#             return
 
-        parts.append('#updated_at = :updated_at')
-        update_expr = "SET " + ", ".join(parts)
+#         parts.append('#updated_at = :updated_at')
+#         update_expr = "SET " + ", ".join(parts)
 
-        print(f"[DYNAMO] UpdateExpression: {update_expr}")
-        print(f"[DYNAMO] ExpressionAttributeValues: {expr_values}")
+#         print(f"[DYNAMO] UpdateExpression: {update_expr}")
+#         print(f"[DYNAMO] ExpressionAttributeValues: {expr_values}")
 
-        customers_table.update_item(
-            Key={'customer_id': phone},
-            UpdateExpression=update_expr,
-            ExpressionAttributeNames=expr_names,
-            ExpressionAttributeValues=expr_values
-        )
-        print(f"[DYNAMO] CRM fields updated successfully")
-    except Exception as e:
-        print(f"[DYNAMO] ERROR in update_customer_crm: {e}")
-        import traceback
-        print(traceback.format_exc())
+#         customers_table.update_item(
+#             Key={'customer_id': phone},
+#             UpdateExpression=update_expr,
+#             ExpressionAttributeNames=expr_names,
+#             ExpressionAttributeValues=expr_values
+#         )
+#         print(f"[DYNAMO] CRM fields updated successfully")
+#     except Exception as e:
+#         print(f"[DYNAMO] ERROR in update_customer_crm: {e}")
+#         import traceback
+#         print(traceback.format_exc())
+
+def update_customer_crm(phone: str, updates: Dict):
+    """
+    Updates only allowed fields provided in the 'updates' dict.
+    """
+    # 1. Define strictly what the AI/Function is allowed to change
+    ALLOWED_KEYS = {
+        'contact_name': 'contact_name',
+        'email': 'email',
+        'lead_intent': 'lead_intent',
+        'summary': 'summary',
+        'enquiry_bedrooms': 'enquiry_bedrooms',
+        'status': 'status',
+        'enquiry_max_price': 'enquiry_max_price',
+        # Add others from your list here...
+    }
+
+    parts = []
+    expr_names = {}
+    expr_values = {':now': datetime.now().isoformat()}
+
+    # 2. Loop through the incoming data
+    for key, value in updates.items():
+        if key in ALLOWED_KEYS and value not in (None, 'Unknown', ''):
+            clean_key = f"#{key}"
+            clean_val = f":{key}"
+            
+            parts.append(f"{clean_key} = {clean_val}")
+            expr_names[clean_key] = ALLOWED_KEYS[key]
+            expr_values[clean_val] = value
+
+    if not parts:
+        return "No valid fields to update."
+
+    # 3. Always update the timestamp
+    parts.append("#upd = :now")
+    expr_names["#upd"] = "updated_at"
+
+    # 4. Perform the "Surgical" Update
+    customers_table.update_item(
+        Key={'customer_id': phone},
+        UpdateExpression="SET " + ", ".join(parts),
+        ExpressionAttributeNames=expr_names,
+        ExpressionAttributeValues=expr_values
+    )
 
 # Parse the email body from Loop to get enquiry details from the user
 def parse_loop_enquiry(body) -> dict:

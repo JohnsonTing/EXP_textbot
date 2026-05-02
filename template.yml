@@ -10,10 +10,19 @@ Description: An AWS Serverless Application Model (SAM) template describing your 
 Parameters:
   OpenAiApiKey:
     Type: String
+    NoEcho: true
   TwilioSid:
     Type: String
+    NoEcho: true
   TwilioAuthToken:
     Type: String
+    NoEcho: true
+  JiraWebhookUrl:
+    Type: String
+    NoEcho: true
+  JiraWebhookToken:
+    Type: String
+    NoEcho: true
 Resources:
   EXPBotMessageHandler:
     Type: AWS::Serverless::Function
@@ -30,6 +39,8 @@ Resources:
           OPENAI_API_KEY: !Ref OpenAiApiKey
           TWILIO_AUTH_TOKEN: !Ref TwilioAuthToken
           TWILIO_ACCOUNT_SID: !Ref TwilioSid
+          JIRA_WEBHOOK_URL: !Ref JiraWebhookUrl
+          JIRA_WEBHOOK_TOKEN: !Ref JiraWebhookToken
       EphemeralStorage:
         Size: 512
       FunctionUrlConfig:
@@ -53,9 +64,18 @@ Resources:
       Tags: {}
       Timeout: 30
       Tracing: PassThrough
-      Role: >-
-        arn:aws:iam::240783391752:role/service-role/exp_bot_connected_with_dynamodb-role-a1lkof4d
-  LambdaLogGroup:
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - AmazonDynamoDBFullAccess 
+      # Events:
+      #   DailyCheckForEngagement:
+      #     Type: ScheduleV2
+      #     Properties:
+      #       ScheduleExpression: "cron(0 9 * * ? *)"
+      #       FlexibleTimeWindow:
+      #         Mode: OFF
+      #       Input: '{"requestContext": {"http": {"method": "POST", "path": "/daily-check"}}}' 
+  LambdaLogGroup:    
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: /aws/lambda/EXPBotMessageHandler
