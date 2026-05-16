@@ -6,7 +6,7 @@ import boto3
 from datetime import datetime
 from config import openai_client
 
-from helpers.db_helpers import customers_table, conversations_table
+from helpers.db_helpers import customers_table, conversations_table, get_customer_id
 
 # ─────────────────────────────────────────────
 # CRM follow-up
@@ -159,13 +159,18 @@ def update_customer_crm(phone: str, updates: Dict):
     if not parts:
         return "No valid fields to update."
 
+    customer_id = get_customer_id(phone)
+    if not customer_id:
+        print(f"[DYNAMO] ERROR in update_customer_crm: no customer found for {phone}")
+        return "Customer not found."
+
     # 3. Always update the timestamp
     parts.append("#upd = :now")
     expr_names["#upd"] = "updated_at"
 
     # 4. Perform the "Surgical" Update
     customers_table.update_item(
-        Key={'customer_id': phone},
+        Key={'customer_id': customer_id},
         UpdateExpression="SET " + ", ".join(parts),
         ExpressionAttributeNames=expr_names,
         ExpressionAttributeValues=expr_values

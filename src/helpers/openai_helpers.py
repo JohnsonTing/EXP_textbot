@@ -10,7 +10,7 @@ from datetime import datetime
 from helpers.email_helpers import send_viewing_request, send_inactive_notification
 from helpers.db_helpers import get_conversation_history, get_customer
 from helpers.scrape_helpers import scrape_exp, scrape_property_details_from_url
-from helpers.db_helpers import save_customer, reset_customer, emit_metric, get_agent_by_email
+from helpers.db_helpers import save_customer, reset_customer, emit_metric, get_agent_by_email, get_customer_id
 from helpers.crm_helpers import update_customer_crm
 from helpers.general_helpers import make_readable_conversation_history
 from config import openai_client, customers_table, conversations_table
@@ -525,7 +525,7 @@ def handle_tool_call(function_name: str, arguments: dict, phone: str, history: l
         property_url = arguments.get("property_url", "")
         print(f"[TOOLS] Rejecting property: {property_url}")
         customers_table.update_item(
-            Key={'customer_id': phone},
+            Key={'customer_id': get_customer_id(phone)},
             UpdateExpression='ADD rejected_listings :url SET updated_at = :ua',
             ExpressionAttributeValues={
                 ':url': {property_url},
@@ -536,7 +536,7 @@ def handle_tool_call(function_name: str, arguments: dict, phone: str, history: l
     elif function_name == 'set_user_inactive':
         reason = arguments.get("reason", "not_interested")
         customers_table.update_item(
-            Key={'customer_id': phone},
+            Key={'customer_id': get_customer_id(phone)},
             UpdateExpression='SET #st = :st, updated_at = :ua, inactive_reason = :r',
             ExpressionAttributeNames={'#st': 'status'},
             ExpressionAttributeValues={

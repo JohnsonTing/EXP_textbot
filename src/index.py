@@ -1,5 +1,6 @@
 import json
 import logging
+import uuid
 from datetime import datetime, timezone, timedelta
 from xml.dom.minidom import Attr
 import re
@@ -253,7 +254,7 @@ def handler(event, context):
             enquiry_details['updated_at'] = datetime.now().isoformat()
             if not personal_phone:
                 return {'statusCode': 400, 'body': json.dumps({'error': 'Phone number missing'})}
-            enquiry_details['customer_id'] = "+44" + personal_phone[1:] if personal_phone.startswith("0") else personal_phone
+            enquiry_details['phone'] = "+44" + personal_phone[1:] if personal_phone.startswith("0") else personal_phone
             enquiry_details['contact_name'] = enquiry_details['First Name']
             enquiry_details['enquiry_postcode'] = enquiry_details["Postcode"] if enquiry_details["Postcode"] else ""
             enquiry_details['status'] = 'active'
@@ -286,26 +287,26 @@ def handler(event, context):
             enquiry_details['scraped_listings'] = json.dumps(listings)
 
             # Clean up all user details before saving it to the DB
-            clean_item = {                                                                           
-                'customer_id':             enquiry_details['customer_id'],
-                'contact_name':            enquiry_details.get('First Name', ''), 
+            clean_item = {
+                'customer_id':             str(uuid.uuid4()),
+                'phone':                   enquiry_details['phone'],
+                'contact_name':            enquiry_details.get('First Name', ''),
                 'customer_type':           customer_type,
                 'First Name':             enquiry_details.get('First Name', ''),
                 'Last Name':              enquiry_details.get('Last Name', ''),
-                'email':                   enquiry_details.get('email', ''),                         
+                'email':                   enquiry_details.get('email', ''),
                 'enquiry_postcode':        enquiry_details.get('Postcode', ''),
-                'enquiry_bedrooms':        enquiry_details.get('enquiry_bedrooms', ''),              
-                'enquiry_max_price':       enquiry_details.get('enquiry_max_price'),               
-                'enquired_property':       enquiry_details.get('enquired_property', ''),             
+                'enquiry_bedrooms':        enquiry_details.get('enquiry_bedrooms', ''),
+                'enquiry_max_price':       enquiry_details.get('enquiry_max_price'),
+                'enquired_property':       enquiry_details.get('enquired_property', ''),
                 'responsible_agent_email': responsible_agent_email,
                 'responsible_agent_id':   responsible_agent_id,
                 'responsible_agent_name': responsible_agent_name,
-                'scraped_listings':        json.dumps(listings),                                     
-                'status':                  'active',                                               
-                'created_at':              enquiry_details['created_at'],                            
-                'updated_at':              enquiry_details['updated_at'],  
-                'bot_paused':             False,          
-                'phone':                   enquiry_details['customer_id'], # Store phone number in a separate attribute for easier querying              
+                'scraped_listings':        json.dumps(listings),
+                'status':                  'active',
+                'created_at':              enquiry_details['created_at'],
+                'updated_at':              enquiry_details['updated_at'],
+                'bot_paused':             False,
                 'Comment':                enquiry_details.get('Comments', ''),
             }            
             print(f"[HANDLER] Cleaned item to save to DB: {clean_item}")                                                                            
@@ -325,8 +326,8 @@ def handler(event, context):
             # # address_no_number = re.sub(r’^\d+\s*’, '’, enquiry_details['Address’])
 
             #If the number is not recognized as a valid UK number after cleaning, send email to Jeroen, Johnson and log an error and raise an exception
-            if enquiry_details.get('customer_id') and not bool(re.match(r'^(\+447|07)\d{9}$', enquiry_details.get('customer_id', ''))):
-                print(f"[HANDLER] ERROR: Invalid phone number format after cleaning. customer_id={enquiry_details.get('customer_id')}")
+            if enquiry_details.get('phone') and not bool(re.match(r'^(\+447|07)\d{9}$', enquiry_details.get('phone', ''))):
+                print(f"[HANDLER] ERROR: Invalid phone number format after cleaning. phone={enquiry_details.get('phone')}")
 
                 # [OLD — Zapier]
                 # zapier_send_email_url = os.environ["ZAPIER_SEND_EMAIL_URL"]
@@ -345,7 +346,7 @@ def handler(event, context):
                     customer_phone=clean_item.get('phone', ''),
                     error_message="Number not recognized as a valid UK mobile number.",
                 )
-                raise ValueError(f"Invalid phone number format: {enquiry_details.get('customer_id')}")
+                raise ValueError(f"Invalid phone number format: {enquiry_details.get('phone')}")
 
             # If the number is valid, proceed to send the first message
             simple_address = enquiry_details.get('Simple Address', '')
@@ -389,7 +390,7 @@ def handler(event, context):
                     try:
                         send_viewing_request(
                             contact_name=clean_item.get('First Name', '') + ' ' + clean_item.get('Last Name', ''),
-                            customer_phone=clean_item['customer_id'],
+                            customer_phone=clean_item['phone'],
                             property_address=simple_address,
                             property_url=property_url,
                             property_price=enquired_property.get('price', ''),
@@ -408,8 +409,8 @@ def handler(event, context):
                         'source':         'enquiry_comment',
                     })
 
-            send_first_message = send_sms(enquiry_details['customer_id'], greet_user_message)
-            save_message(enquiry_details['customer_id'], 'assistant', greet_user_message)
+            send_first_message = send_sms(clean_item['phone'], greet_user_message)
+            save_message(clean_item['phone'], 'assistant', greet_user_message)
             emit_metric('first_message_sent', agent_id=responsible_agent_id, customer_id=clean_item['customer_id'], customer_type=customer_type)
 
             # SENDING THE BOOK VIEWING MESSAGE SEPARATELY
@@ -466,51 +467,51 @@ def handler(event, context):
             print(f"[HANDLER] Found {len(customers)} customers to check")
 
             for customer in customers:
-                customer_id = customer.get('customer_id') #customer_id is the phone number in the customers table
+                customer_id = customer.get('customer_id')  # UUID — used for DynamoDB key only
+                customer_phone = customer.get('phone', '')  # actual phone — used for SMS and Conversations
                 contact_name = customer.get('contact_name') or customer.get('First Name', 'there')
-                print(f"[HANDLER] Checking customer {customer_id} ({contact_name})")
+                print(f"[HANDLER] Checking customer {customer_phone} ({contact_name})")
 
-                if not customer_id:
-                    print(f"[HANDLER] Skipping customer with no customer_id")
+                if not customer_phone:
+                    print(f"[HANDLER] Skipping customer with no phone")
                     continue
 
                 if customer.get('bot_paused'):
-                    print(f"[HANDLER] Skipping paused customer {customer_id}")
-                    skipped.append(customer_id)
+                    print(f"[HANDLER] Skipping paused customer {customer_phone}")
+                    skipped.append(customer_phone)
                     continue
 
                 # Get latest message from Conversations table for this customer
                 conversations_response = conversations_table.query(
                     IndexName='phone_number-timestamp-index',
                     KeyConditionExpression='phone_number = :pn',
-                    ExpressionAttributeValues={':pn': customer_id},
+                    ExpressionAttributeValues={':pn': customer_phone},
                     ScanIndexForward=False,  # newest first
                     Limit=1
                 )
                 messages = conversations_response.get('Items', [])
 
                 if not messages:
-                    print(f"[HANDLER] No messages found for {customer_id}, skipping")
-                    skipped.append(customer_id)
+                    print(f"[HANDLER] No messages found for {customer_phone}, skipping")
+                    skipped.append(customer_phone)
                     continue
 
                 latest_message = messages[0]
                 latest_timestamp_str = latest_message.get('timestamp')
-                print(f"[HANDLER] Latest message for {customer_id}: {messages[0]['message'] if messages else 'No messages found'} at {latest_timestamp_str}")
-
+                print(f"[HANDLER] Latest message for {customer_phone}: {messages[0]['message'] if messages else 'No messages found'} at {latest_timestamp_str}")
 
                 if not latest_timestamp_str:
-                    print(f"[HANDLER] No timestamp on latest message for {customer_id}, skipping")
-                    skipped.append(customer_id)
+                    print(f"[HANDLER] No timestamp on latest message for {customer_phone}, skipping")
+                    skipped.append(customer_phone)
                     continue
 
                 latest_timestamp = datetime.fromisoformat(latest_timestamp_str).replace(tzinfo=timezone.utc)
                 days_since = (now - latest_timestamp).days
-                print(f"[HANDLER] {customer_id} — last active {days_since} days ago")
+                print(f"[HANDLER] {customer_phone} — last active {days_since} days ago")
 
                 if latest_timestamp < cutoff:
-                    print(f"[HANDLER] {customer_id} is inactive for more than 14 days, re-engaging")
-                    reengaged.append(customer_id)
+                    print(f"[HANDLER] {customer_phone} is inactive for more than 14 days, re-engaging")
+                    reengaged.append(customer_phone)
 
                     # Scrape again any new properties based on their original enquiry details and update their record in the DB with the new list of properties
                     # Text them this new list of properties to reengage them and see if they're interested in any of the new ones
@@ -524,8 +525,8 @@ def handler(event, context):
                     )
                     rejected = set(customer.get("rejected_listings", []))
                     listings = [l for l in listings if l.get("url") not in rejected]
-                    print(f"[HANDLER] Scraped {len(listings)} properties for re-engagement of {customer_id} (after filtering rejected)")
-                    print(f"[HANDLER] Sample scraped property for {customer_id}: {listings[0] if listings else 'No properties found'}")
+                    print(f"[HANDLER] Scraped {len(listings)} properties for re-engagement of {customer_phone} (after filtering rejected)")
+                    print(f"[HANDLER] Sample scraped property for {customer_phone}: {listings[0] if listings else 'No properties found'}")
 
                     customers_table.update_item(
                         Key={'customer_id': customer_id},
@@ -536,20 +537,20 @@ def handler(event, context):
 
                     # All details are extracted from their enquiry. Send them a first message.
                     message = f"Hi {contact_name}, just checking in — how are you doing? Still on the lookout for a property?"
-                    send_sms(customer_id, message)
-                    save_message(customer_id, 'assistant', message)
+                    send_sms(customer_phone, message)
+                    save_message(customer_phone, 'assistant', message)
 
                     # Send them the list of similar properties we found
                     listing_message = format_scraped_properties_into_listings_message(listings, 3)
                     print("[HANDLER] Re-engagement listing message:", listing_message)
-                    send_sms(customer_id, listing_message)
-                    save_message(customer_id, 'assistant', listing_message)
+                    send_sms(customer_phone, listing_message)
+                    save_message(customer_phone, 'assistant', listing_message)
                     emit_metric('reengagement_sent', agent_id=customer.get('responsible_agent_id', ''), customer_id=customer_id, customer_type=customer.get('customer_type', ''))
-                    print(f"[HANDLER] Re-engaged {customer_id}")
+                    print(f"[HANDLER] Re-engaged {customer_phone}")
 
                 else:
-                    skipped.append(customer_id)
-                    print(f"[HANDLER] {customer_id} is still active, skipping")
+                    skipped.append(customer_phone)
+                    print(f"[HANDLER] {customer_phone} is still active, skipping")
 
             print(f"[HANDLER] Daily check complete. Re-engaged: {len(reengaged)}, Skipped: {len(skipped)}")
             return {

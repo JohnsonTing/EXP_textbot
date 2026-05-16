@@ -15,8 +15,12 @@ from config import dynamodb, customers_table, conversations_table, agents_table,
 def get_customer(phone: str) -> Optional[Dict]:
     print(f"[DYNAMO] Getting customer record for: {phone}")
     try:
-        response = customers_table.get_item(Key={'customer_id': phone})
-        item = response.get('Item')
+        response = customers_table.query(
+            IndexName='phone-index',
+            KeyConditionExpression=boto3.dynamodb.conditions.Key('phone').eq(phone)
+        )
+        items = response.get('Items', [])
+        item = items[0] if items else None
         print(f"[DYNAMO] Customer found: {item is not None}")
         return item
     except Exception as e:
@@ -24,11 +28,19 @@ def get_customer(phone: str) -> Optional[Dict]:
         raise
 
 
+def get_customer_id(phone: str) -> Optional[str]:
+    customer = get_customer(phone)
+    return customer.get('customer_id') if customer else None
+
+
 def save_customer(phone: str, enquiry: Dict, listings: List[Dict]):
     print(f"[DYNAMO] Saving customer: {phone} with {len(listings)} listings")
     try:
+        existing = get_customer(phone)
+        customer_id = existing.get('customer_id') if existing else str(uuid.uuid4())
         customers_table.put_item(Item={
-            'customer_id':        phone,
+            'customer_id':        customer_id,
+            'phone':              phone,
             # ── Contact info ──
             'contact_name':       enquiry.get('contact_name', ''),
             'email':              enquiry.get('email', ''),
@@ -42,13 +54,13 @@ def save_customer(phone: str, enquiry: Dict, listings: List[Dict]):
             # ── Search criteria ──
             'enquiry_postcode':   enquiry.get('postcode', ''),
             'enquiry_bedrooms':   enquiry.get('bedrooms', 0),
-            'max_price':  enquiry.get('max_price', 0),
+            'max_price':          enquiry.get('max_price', 0),
             'enquiry_prop_type':  enquiry.get('prop_type', 'Any property type'),
             'scraped_listings':   json.dumps(listings),
             'created_at':         datetime.now().isoformat(),
             'updated_at':         datetime.now().isoformat(),
             'status':             'active',
-            'bot_paused':        False
+            'bot_paused':         False
         })
         print(f"[DYNAMO] Customer saved successfully")
     except Exception as e:
@@ -125,7 +137,9 @@ def emit_metric(event_type: str, agent_id: str, customer_id: str = '', customer_
 def reset_customer(phone: str):
     print(f"[RESET] Resetting customer: {phone}")
     try:
-        customers_table.delete_item(Key={'customer_id': phone})
+        customer_id = get_customer_id(phone)
+        if customer_id:
+            customers_table.delete_item(Key={'customer_id': customer_id})
     except Exception as e:
         print(f"[DYNAMO] ERROR deleting customer: {e}")
 
