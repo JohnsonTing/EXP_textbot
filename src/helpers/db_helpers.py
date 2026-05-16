@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 import boto3
 
-from config import dynamodb, customers_table, conversations_table
+from config import dynamodb, customers_table, conversations_table, agents_table, metrics_table
 
 # ─────────────────────────────────────────────
 # DynamoDB helpers
@@ -34,7 +34,9 @@ def save_customer(phone: str, enquiry: Dict, listings: List[Dict]):
             'email':              enquiry.get('email', ''),
             'tags':               enquiry.get('tags', []),
             # ── Lead details ──
-            'lead_intent':        enquiry.get('lead_intent', ''),
+            'lead_intent':              enquiry.get('lead_intent', ''),
+            'customer_type':            enquiry.get('customer_type', 'buyer'),
+            'responsible_agent_email':  enquiry.get('responsible_agent_email', ''),
             'summary':            enquiry.get('summary', ''),
             'property_in_mind':   enquiry.get('property_in_mind', ''),
             # ── Search criteria ──
@@ -45,7 +47,8 @@ def save_customer(phone: str, enquiry: Dict, listings: List[Dict]):
             'scraped_listings':   json.dumps(listings),
             'created_at':         datetime.now().isoformat(),
             'updated_at':         datetime.now().isoformat(),
-            'status':             'active'
+            'status':             'active',
+            'bot_paused':        False
         })
         print(f"[DYNAMO] Customer saved successfully")
     except Exception as e:
@@ -83,6 +86,40 @@ def save_message(phone: str, role: str, message: str):
     except Exception as e:
         print(f"[DYNAMO] ERROR in save_message: {e}")
         # Non-fatal — log and continue
+
+
+def get_agent_by_email(email: str) -> Optional[Dict]:
+    print(f"[DYNAMO] Looking up agent by email: {email}")
+    try:
+        response = agents_table.query(
+            IndexName='email-index',
+            KeyConditionExpression=boto3.dynamodb.conditions.Key('email').eq(email)
+        )
+        items = response.get('Items', [])
+        agent = items[0] if items else None
+        print(f"[DYNAMO] Agent found: {agent is not None}")
+        return agent
+    except Exception as e:
+        print(f"[DYNAMO] ERROR in get_agent_by_email: {e}")
+        return None
+
+
+def emit_metric(event_type: str, agent_id: str, customer_id: str = '', customer_type: str = '', metadata: dict = None):
+    print(f"[DYNAMO] Emitting metric: {event_type} | agent={agent_id} | customer={customer_id}")
+    try:
+        item = {
+            'agent_id':      agent_id,
+            'timestamp':     datetime.now().isoformat() + '#' + uuid.uuid4().hex[:8],
+            'event_type':    event_type,
+            'customer_id':   customer_id,
+            'customer_type': customer_type,
+        }
+        if metadata:
+            item['metadata'] = metadata
+        metrics_table.put_item(Item=item)
+        print(f"[DYNAMO] Metric emitted: {event_type}")
+    except Exception as e:
+        print(f"[DYNAMO] ERROR in emit_metric: {e}")
 
 
 def reset_customer(phone: str):

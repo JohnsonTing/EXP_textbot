@@ -134,12 +134,12 @@ def update_customer_crm(phone: str, updates: Dict):
     ALLOWED_KEYS = {
         'contact_name': 'contact_name',
         'email': 'email',
+        'customer_type': 'customer_type',
         'lead_intent': 'lead_intent',
         'summary': 'summary',
         'enquiry_bedrooms': 'enquiry_bedrooms',
         'status': 'status',
         'enquiry_max_price': 'enquiry_max_price',
-        # Add others from your list here...
     }
 
     parts = []
@@ -171,28 +171,168 @@ def update_customer_crm(phone: str, updates: Dict):
         ExpressionAttributeValues=expr_values
     )
 
+def parse_email_enquiry(body) -> dict:
+    """
+    Multi-format email parser — handles Moneypenny, Lee (voice agent), and generic/Loop.
+    Returns keys compatible with the /first-message handler.
+    Ported from Zapier JS extraction step.
+    """
+    if isinstance(body, dict):
+        body = str(body)
+    body = body.replace("\\n", "\n")
+
+    first_name = last_name = email = address = simple_address = ''
+    phone = postcode = comments = transaction_type = buyer_or_renter = responsible_agent_email = ''
+
+    if "Moneypenny" in body:
+        m = re.search(r'Caller Name\s*:\s*([A-Z][a-z]+)\s+([A-Z][a-z]+)', body, re.IGNORECASE)
+        if m:
+            first_name, last_name = m.group(1).strip(), m.group(2).strip()
+        else:
+            fn = re.search(r'(?:First Name|Hi|Hello)[:\s]+([A-Z][a-z]+)', body, re.IGNORECASE)
+            if fn: first_name = fn.group(1).strip()
+            ln = re.search(r'(?:Surname|Last Name)[:\s]+([A-Z][a-z]+)', body, re.IGNORECASE)
+            if ln: last_name = ln.group(1).strip()
+
+        em = re.search(r'Email Address[:\s]+([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', body, re.IGNORECASE)
+        if em: email = em.group(1).strip()
+        else:
+            fb = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', body, re.IGNORECASE)
+            if fb: email = fb.group(1).strip()
+
+        ph = re.search(r'(?:Contact Number|Caller Number|Phone|Tel|Mobile)[:\s]+([\d\s\-+()]{7,})', body, re.IGNORECASE)
+        if not ph: ph = re.search(r'(0\d{3,4}[\s\-]?\d{3}[\s\-]?\d{3,4})', body, re.IGNORECASE)
+        if ph: phone = ph.group(1).strip()
+
+        addr = re.search(r'(?:Property Address|Address)[:\s]*([^\n]+)', body, re.IGNORECASE)
+        if addr:
+            address = addr.group(1).strip()
+            sa = re.search(r'(?:\w+\s+){1,3}(?:Road|Street|Avenue|Ave|Lane|Close|Drive|Way|Place|Crescent|Gardens?|Grove|Terrace|Court|Walk|Rise|Hill|Mews)\b', address, re.IGNORECASE)
+            if sa: simple_address = re.sub(r'^\d+\s+', '', sa.group(0).strip())
+
+        pc = re.search(r'postcode:\s*([A-Z]{1,2}\d{1,2}\s*\d[A-Z]{2})', body, re.IGNORECASE)
+        if not pc: pc = re.search(r'([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})', body, re.IGNORECASE)
+        if not pc: pc = re.search(r'\b([A-Z]{1,2}\d{1,2}[A-Z]?)\b', body, re.IGNORECASE)  # district fallback e.g. SE22, SW2
+        if pc: postcode = pc.group(1).upper().strip()
+
+        cm = re.search(r'(?:Comment|Enquiry)\s*:\s*([^\n]+)', body, re.IGNORECASE)
+        if cm: comments = cm.group(1).strip()
+
+        is_lettings = 'LETTENQ' in body or bool(re.search(r'Sales\s+or\s+Lettings[:\s]+Lettings', body, re.IGNORECASE))
+        transaction_type, buyer_or_renter = ('lettings', 'renter') if is_lettings else ('sales', 'buyer')
+
+    elif "Sent by Lee (voice agent)" in body:
+        clean = re.sub(r'\*([^*]+)\*', r'\1', body).replace('* * *', '')
+
+        m = re.search(r'Caller\s*:\s*(\S+)(?:\s+(\S+))?', clean, re.IGNORECASE)
+        if m:
+            first_name = m.group(1).strip()
+            last_name = m.group(2).strip() if m.group(2) else ''
+
+        em = re.search(r'^Email(?:\s*Address)?\s*:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', clean, re.IGNORECASE | re.MULTILINE)
+        if em: email = em.group(1).strip()
+        else:
+            body_only = re.sub(r'^(From|To|Cc|Bcc):.*$', '', clean, flags=re.IGNORECASE | re.MULTILINE)
+            fb = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', body_only, re.IGNORECASE)
+            if fb: email = fb.group(1).strip()
+
+        ph = re.search(r'(?:Contact Number|Caller Number|Phone|Tel|Mobile)\s*:\s*([\+\d][\d\s\-()]{6,})', clean, re.IGNORECASE)
+        if not ph: ph = re.search(r'(\+44[\d\s]{9,})', clean, re.IGNORECASE)
+        if not ph: ph = re.search(r'(0\d{3,4}[\s\-]?\d{3}[\s\-]?\d{3,4})', clean, re.IGNORECASE)
+        if ph: phone = re.sub(r'\s', '', ph.group(1)).strip()
+
+        addr = re.search(r'(?:Property Address|Property|Address)\s*:\s*([^\n(]+)', clean, re.IGNORECASE)
+        if addr:
+            address = addr.group(1).strip()
+            sa = re.search(r'(?:\w+\s+){1,3}(?:Road|Street|Avenue|Ave|Lane|Close|Drive|Way|Place|Crescent|Gardens?|Grove|Terrace|Court|Walk|Rise|Hill|Mews)\b', address, re.IGNORECASE)
+            if sa: simple_address = re.sub(r'^\d+\s+', '', sa.group(0).strip())
+
+        pc = re.search(r'postcode:\s*([A-Z]{1,2}\d{1,2}\s*\d[A-Z]{2})', clean, re.IGNORECASE)
+        if not pc: pc = re.search(r'([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})', clean, re.IGNORECASE)
+        if not pc: pc = re.search(r'\b([A-Z]{1,2}\d{1,2}[A-Z]?)\b', clean, re.IGNORECASE)  # district fallback e.g. SE22, SW2
+        if pc: postcode = pc.group(1).upper().strip()
+
+        notes = re.search(r'Notes\s*:\s*\n+\s*([^\n]+)', clean, re.IGNORECASE)
+        summary = re.search(r'Summary\s*:\s*\n+\s*([^\n]+)', clean, re.IGNORECASE)
+        if notes and notes.group(1).strip(): comments = notes.group(1).strip()
+        elif summary and summary.group(1).strip(): comments = summary.group(1).strip()
+
+        is_lettings = bool(re.search(r'renter|tenant|letting|rental', clean, re.IGNORECASE))
+        transaction_type, buyer_or_renter = ('lettings', 'renter') if is_lettings else ('sales', 'buyer')
+
+    else:
+        # Generic / Loop fallback
+        fn = re.search(r'(?:Name|First Name|Caller Name|Hi|Hello)[:\s]+([A-Z][a-z]+)', body, re.IGNORECASE)
+        if fn: first_name = fn.group(1).strip()
+        ln = re.search(r'(?:Surname|Last Name)[:\s]+([A-Z][a-z]+)', body, re.IGNORECASE)
+        if ln: last_name = ln.group(1).strip()
+
+        em = re.search(r'^Email(?:\s*Address)?\s*:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', body, re.IGNORECASE | re.MULTILINE)
+        if em: email = em.group(1).strip()
+        else:
+            body_only = re.sub(r'^(From|To|Cc|Bcc):.*$', '', body, flags=re.IGNORECASE | re.MULTILINE)
+            fb = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', body_only, re.IGNORECASE)
+            if fb: email = fb.group(1).strip()
+
+        ph = re.search(r'(?:Phone Daytime|Phone Evening|Contact Number|Phone|Tel|Mobile|Telephone|Caller Number)[:\s]+([\d\s\-+()]{7,})', body, re.IGNORECASE)
+        if not ph: ph = re.search(r'(\+\d{1,3}[\s\-]?\d[\d\s\-()]{7,})', body, re.IGNORECASE)
+        if not ph: ph = re.search(r'(0\d{3,4}[\s\-]?\d{3}[\s\-]?\d{3,4})', body, re.IGNORECASE)
+        if not ph: ph = re.search(r'((?:\d[\d\s\-()]{7,})|(?:\([0-9]\)[\d\s\-]{6,}))', body, re.IGNORECASE)
+        if ph: phone = ph.group(1).strip()
+
+        addr = re.search(r'(?:Address|Property Address)[:\s]*([^\n]+)', body, re.IGNORECASE)
+        if addr:
+            address = addr.group(1).strip()
+            sa = re.search(r'(?:\w+\s+){1,3}(?:Road|Street|Avenue|Ave|Lane|Close|Drive|Way|Place|Crescent|Gardens?|Grove|Terrace|Court|Walk|Rise|Hill|Mews)\b', address, re.IGNORECASE)
+            if sa: simple_address = re.sub(r'^\d+\s+', '', sa.group(0).strip())
+
+        pc = re.search(r'postcode:\s*([A-Z]{1,2}\d{1,2}\s*\d[A-Z]{2})', body, re.IGNORECASE)
+        if not pc: pc = re.search(r'([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})', body, re.IGNORECASE)
+        if not pc: pc = re.search(r'\b([A-Z]{1,2}\d{1,2}[A-Z]?)\b', body, re.IGNORECASE)  # district fallback e.g. SE22, SW2
+        if pc: postcode = pc.group(1).upper().strip()
+
+        cm = re.search(r'(?:Comment|Enquiry):\s*([^\n]+)', body, re.IGNORECASE)
+        if cm: comments = cm.group(1).strip()
+
+        is_lettings = 'LETTENQ' in body or bool(re.search(r'Sales\s+or\s+Lettings[:\s]+Lettings', body, re.IGNORECASE))
+        transaction_type, buyer_or_renter = ('lettings', 'renter') if is_lettings else ('sales', 'buyer')
+
+        all_emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', body)
+        responsible_agent_email = all_emails[-1] if all_emails else ''
+
+    phone = re.sub(r'\s', '', phone).strip()
+    address = address.rstrip(',').strip()
+
+    result = {
+        'First Name':              first_name,
+        'Last Name':               last_name,
+        'Email Address':           email,
+        'Phone Number':            phone,
+        'Postcode':                postcode,
+        'Simple Address':          simple_address,
+        'Address':                 address,
+        'Customer Type':           buyer_or_renter,
+        'Responsible Agent Email': responsible_agent_email,
+        'Comments':                comments,
+        'transaction_type':        transaction_type,
+    }
+    print("Parsed email enquiry:", result)
+    return result
+
+
 # Parse the email body from Loop to get enquiry details from the user
 def parse_loop_enquiry(body) -> dict:
     if isinstance(body, dict):
         body = str(body)
-    start = body.index("# New Enquiry") + len("# New Enquiry")
-    end = body.index("For further information")
-    section = body[start:end]
-    print("section", section)
 
-    # Clean and split
-    parts = [p.strip() for p in section.split("\\n") if p.strip()]
+    body = body.replace("\\n", "\n")
+    parts = [p.strip() for p in body.split("\n") if p.strip()]
 
     result = {}
-    for i, part in enumerate(parts):
-        if part.endswith(":"):  # it's a key
-            key = part.rstrip(":")
-            next_part = parts[i + 1] if i + 1 < len(parts) else None
-            # If next part is also a key, this field is empty
-            if next_part is not None and not next_part.endswith(":"):
-                result[key] = next_part
-            else:
-                continue
- 
+    for part in parts:
+        if ':' in part:
+            key, _, value = part.partition(':')
+            result[key.strip()] = value.strip()
 
+    print("Parsed Loop Enquiry:", result)
     return result

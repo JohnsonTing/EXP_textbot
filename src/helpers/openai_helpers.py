@@ -7,9 +7,10 @@ import boto3
 import time
 import requests
 from datetime import datetime
+from helpers.email_helpers import send_viewing_request, send_inactive_notification
 from helpers.db_helpers import get_conversation_history, get_customer
 from helpers.scrape_helpers import scrape_exp, scrape_property_details_from_url
-from helpers.db_helpers import save_customer, reset_customer
+from helpers.db_helpers import save_customer, reset_customer, emit_metric, get_agent_by_email
 from helpers.crm_helpers import update_customer_crm
 from helpers.general_helpers import make_readable_conversation_history
 from config import openai_client, customers_table, conversations_table
@@ -40,6 +41,11 @@ tools = [
                         "type": "string",
                         "enum": ["Any property type", "Semi-detached house", "Detached house", "Flat", "Bungalow", "Cottage"],
                         "description": "Type of property"
+                    },
+                    "customer_type": {
+                        "type": "string",
+                        "enum": ["buyer", "renter"],
+                        "description": "Whether the customer is looking to buy or rent. Infer from context if not explicitly stated."
                     }
                 },
                 "required": ["postcode"]
@@ -139,7 +145,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "update_crm",
-            "description": "Update the customer's details when they provide their name, email, or buying intent.",
+            "description": "Update the customer's details when they provide their name, email, buying/renting intent, or other profile info.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -151,9 +157,13 @@ tools = [
                         "type": "string",
                         "description": "Customer's email address, empty string if not provided"
                     },
+                    "customer_type": {
+                        "type": "string",
+                        "enum": ["buyer", "renter"],
+                        "description": "Whether the customer is looking to buy or rent. Set as soon as this is clear from the conversation."
+                    },
                     "lead_intent": {
                         "type": "string",
-                        # "enum": ["Buying", "Renting", "Investing", "Unknown"],
                         "description": "What the customer is looking to do"
                     },
                     "summary": {
@@ -204,38 +214,28 @@ def create_property_listing_summary(properties: Dict) -> str:
         properties = properties[:3]
     prompt = "List ALL {len(listings)} properties you found with their address, price, bed count, type, and URL. Do not summarise — list every single one."
 
-def enquire_openai(message: str):
-    print(f"[OPENAI] Sending one-off message to OpenAI: {message[:100]}")
+def enquire_openai(system_prompt: str, user_content: str, max_tokens: int = 300) -> str:
+    print(f"[OPENAI] enquire_openai | system={system_prompt[:60]!r} | user={user_content[:60]!r}")
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4o",
-            max_tokens=300,
+            max_tokens=max_tokens,
             messages=[
-                {
-                    "role": "system",
-                    "content": f'{message}'
-                },
-                {"role": "user", "content": message}
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
             ]
         )
-        openai_returned_text = response.choices[0].message.content.strip()
-        print(f"[OPENAI] Raw response: {openai_returned_text}")
-        return(openai_returned_text)
+        result = response.choices[0].message.content.strip()
+        print(f"[OPENAI] Raw response: {result}")
+        return result
     except Exception as e:
-        print(f"[OPENAI] ERROR in sending message: {e}")
-        return("")
+        print(f"[OPENAI] ERROR in enquire_openai: {e}")
+        return ""
 
 
 def extract_enquiry_details(message: str) -> Dict:
     print(f"[OPENAI] Extracting enquiry details from message: {message[:100]}")
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o",
-            max_tokens=300,
-            messages=[
-                {
-                    "role": "system",
-                    "content": """Extract property search details from the message.
+    system_prompt = """Extract property search details from the message.
                     Return ONLY valid JSON with these exact keys:
                     - contact_name (string): the person's name if mentioned, else empty string
                     - email (string): email address if mentioned, else empty string
@@ -248,13 +248,8 @@ def extract_enquiry_details(message: str) -> Dict:
                     - max_price (integer, 0 if not mentioned, no commas)
                     - prop_type (string, one of: 'Any property type', 'Semi-detached house', 'Detached house', 'Flat', 'Bungalow', 'Cottage')
                     If you cannot find any location at all, set postcode to empty string."""
-                },
-                {"role": "user", "content": message}
-            ]
-        )
-        text = response.choices[0].message.content.strip()
-        print(f"[OPENAI] Raw response: {text}")
-        text = re.sub(r'```json|```', '', text).strip()
+    try:
+        text = re.sub(r'```json|```', '', enquire_openai(system_prompt, message)).strip()
         parsed = json.loads(text)
         print(f"[OPENAI] Parsed enquiry: {parsed}")
         return parsed
@@ -266,16 +261,68 @@ def extract_enquiry_details(message: str) -> Dict:
         return {"postcode": "", "bedrooms": 0, "max_price": 0, "prop_type": "Any property type"}
 
 
+def detect_viewing_request(comment: str) -> dict:
+    print(f"[OPENAI] Checking if enquiry comment is a viewing request | comment={comment[:80]!r}")
+    system_prompt = (
+        "You detect viewing requests in property enquiry comments. "
+        "Return ONLY valid JSON with two keys: "
+        "\"is_viewing_request\" (boolean) — true if the customer is asking to view or visit the property; "
+        "\"preferred_time\" (string) — the exact time/date they requested, empty string if not specified."
+    )
+    try:
+        text = re.sub(r'```json|```', '', enquire_openai(system_prompt, comment, max_tokens=80)).strip()
+        result = json.loads(text)
+        print(f"[OPENAI] Viewing request detection result: {result}")
+        return result
+    except Exception as e:
+        print(f"[OPENAI] ERROR in detect_viewing_request: {e}")
+        return {"is_viewing_request": False, "preferred_time": ""}
+
+
+def answer_customer_question(question: str, property_details: dict) -> Optional[str]:
+    print(f"[OPENAI] Attempting to answer customer question from property details | question={question[:80]!r}")
+    system_prompt = (
+        "You are a property assistant. A customer asked a question in their enquiry about a property. "
+        "Answer it using ONLY the information in the property details provided. "
+        "If the property details do not contain enough information to answer, return null. "
+        "Return ONLY valid JSON with one key: \"answer\" (string or null). "
+        "Paraphrase and keep the answer concise: include also the original question — this whole answer will be appended to an SMS message."
+    )
+    try:
+        text = re.sub(r'```json|```', '', enquire_openai(system_prompt, json.dumps({
+            "customer_question": question,
+            "property_details": property_details
+        }), max_tokens=150)).strip()
+        answer = json.loads(text).get("answer")
+        print(f"[OPENAI] Customer question answer: {answer!r}")
+        return answer
+    except Exception as e:
+        print(f"[OPENAI] ERROR in answer_customer_question: {e}")
+        return None
+
+
+def extract_available_date(property_details: dict) -> Optional[str]:
+    system_prompt = (
+        "You extract available dates from property listing text.\n"
+        "Return ONLY valid JSON with one key: \"available_date\" (string or null).\n"
+        "Set \"available_date\" to the exact phrase as written in the listing "
+        "(e.g. \"Now\", \"1st June 2025\", \"Immediately\", \"1 July 2025\").\n"
+        "If no available date is explicitly stated, return {\"available_date\": null}.\n"
+        "Do NOT infer, guess, or make up dates. Only return what is explicitly written."
+    )
+    try:
+        text = re.sub(r'```json|```', '', enquire_openai(system_prompt, json.dumps(property_details), max_tokens=60)).strip()
+        available_date = json.loads(text).get("available_date")
+        print(f"[OPENAI] Available date extracted: {available_date!r}")
+        return available_date
+    except Exception as e:
+        print(f"[OPENAI] ERROR in extract_available_date: {e}")
+        return None
+
+
 def detect_new_search(message: str, current_postcode: str) -> Dict:
     print(f"[OPENAI] Detecting if new search requested | current_postcode={current_postcode}")
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o",
-            max_tokens=300,
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"""You are a UK property search assistant. The user is currently viewing listings in: {current_postcode}.
+    system_prompt = f"""You are a UK property search assistant. The user is currently viewing listings in: {current_postcode}.
 Determine if the user's message is requesting a search in a DIFFERENT area/location.
 
 Return ONLY valid JSON with:
@@ -288,12 +335,8 @@ Return ONLY valid JSON with:
 Examples that ARE a new search: "what about se1?", "can you check greenwich", "show me places in e3", "actually look in lewisham"
 Examples that are NOT a new search: "tell me more about the first one", "which has a garden?", "what is the cheapest?"
 """
-                },
-                {"role": "user", "content": message}
-            ]
-        )
-        text = response.choices[0].message.content.strip()
-        text = re.sub(r'```json|```', '', text).strip()
+    try:
+        text = re.sub(r'```json|```', '', enquire_openai(system_prompt, message)).strip()
         parsed = json.loads(text)
         print(f"[OPENAI] New search detection result: {parsed}")
         return parsed
@@ -309,6 +352,7 @@ def get_ai_response(phone: str, user_message: str) -> str:
     history = history[-10:] # Limit history to last 10 messages for context
     print(f"[OPENAI] Conversation history for {phone}: {history}")
     customer = get_customer(phone)
+    responsible_agent_name = customer.get('responsible_agent_name', '') if customer else ''
 
 #     system_prompt = """You are Chloe, a friendly UK property agent assistant communicating via SMS for EXP. Be very sure to stick within the context. Do not entertain any requests or questions that are not relevant to the customer's property search. 
 # Help customers find properties, answer questions about listings, and book viewings.
@@ -319,7 +363,7 @@ def get_ai_response(phone: str, user_message: str) -> str:
 # If they share their name, email or buying intent, call update_crm.
 # Finally, make sure the end reply is below 1600 characters (so it can fit in one SMS).
 # """
-    system_prompt = """You are Chloe, a friendly and down-to-earth UK property agent assistant texting customers on behalf of EXP's agent Jeroen.
+    system_prompt = f"""You are Chloe, a friendly and down-to-earth UK property agent assistant texting customers on behalf of EXP's agent {responsible_agent_name}.
 
 You chat like a real person — warm, helpful, and easy to talk to. Keep messages concise and natural, like a quick text, not an email. Avoid sounding robotic or overly formal. You are the kind of person that don't like using exclamation marks or emojis. 
 Do not use emojis, exclamation marks, "**" or bolding in your response.
@@ -337,7 +381,7 @@ Guidelines:
 - If the customer wants to search for properties:
     Call the tool search_properties
     Show them at most 3 properties at a time and format each property strictly as a single line:
-        "{address}, {bedrooms}-bed {property_type} at {price}. {url}"
+        "{{address}}, {{bedrooms}}-bed {{property_type}} at {{price}}. {{url}}"
     Example: "Woodford Road E18, 4-bed Semi-detached house at £925,000. https://exp.uk.com/..."
     Do not include status, bullet points, or extra labels. One line per property.
 
@@ -351,11 +395,11 @@ Guidelines:
     If the property is not known from the context, ask them which one they're interested in
     Ask them when they are available for a viewing: "Let me get that organised for you, can you let me know a few days and times that you can do so that I can get this booked in for you?"
     Call book_viewing 
-    Say "Great, I'll try to arrange that viewing for you with your agent Jeroen. They will be in touch to confirm a viewing. Are there any other properties you're interested in?"
+    Say "Great, I'll try to arrange that viewing for you with your agent {responsible_agent_name}. They will be in touch to confirm a viewing." Do not ask if they are interested in other properites yet.
 - If they share details like name, email, or buying intent => call update_crm
 - If the customer says they are not interested in a specific property (e.g. "not that one", "skip that", "don't like it", "not for me") => call reject_property with the property URL. That property will never be shown to them again. Acknowledge briefly, e.g. "No problem, I'll take that one off the list."
-- If the customer says they have already found a property => call set_user_inactive with reason "found_a_property", say something like "That's great news, congrats. I'll let Jeroen know. All the best with the move."
-- If the customer says they are no longer searching (e.g. changed plans, not moving anymore) => call set_user_inactive with reason "no_longer_searching", say something like "No problem at all. I'll let Jeroen know. Feel free to get in touch if you start looking again."
+- If the customer says they have already found a property => call set_user_inactive with reason "found_a_property", say something like "That's great news, congrats. I'll let {responsible_agent_name} know. All the best with the move."
+- If the customer says they are no longer searching (e.g. changed plans, not moving anymore) => call set_user_inactive with reason "no_longer_searching", say something like "No problem at all. I'll let {responsible_agent_name} know. Feel free to get in touch if you start looking again."
 - If the customer is not interested in receiving any more properties from us => call set_user_inactive with reason "not_interested"
 
 STRICT FORMAT RULES — never break these:
@@ -415,12 +459,19 @@ def handle_tool_call(function_name: str, arguments: dict, phone: str, history: l
     print(f"[TOOLS] Calling {function_name} with {arguments}")
 
     if function_name == "search_properties":
-        max_price=arguments.get("max_price", 0)
+        existing_customer = get_customer(phone)
+        customer_type = arguments.get("customer_type") or (existing_customer.get("customer_type") if existing_customer else None) or "buyer"
+        print(f"[TOOLS] Determined customer type: {customer_type}")
+        listing_type = "rental" if customer_type == "renter" else "sale"
+        radius = 4 if customer_type == "buyer" else 5
+        max_price = arguments.get("max_price", 0)
         listings = scrape_exp(
             postcode=arguments["postcode"],
             max_price=max_price,
             min_beds=arguments.get("min_beds", 0),
-            prop_type=arguments.get("prop_type", "Any property type")
+            prop_type=arguments.get("prop_type", "Any property type"),
+            radius=radius,
+            listing_type=listing_type
         )
         formatted_listings_for_response = []
         if listings:
@@ -436,12 +487,14 @@ def handle_tool_call(function_name: str, arguments: dict, phone: str, history: l
                 "postcode": arguments["postcode"],
                 "bedrooms": arguments.get("min_beds", 0),
                 "max_price": arguments.get("max_price", 0),
-                "prop_type": arguments.get("prop_type", "Any property type")
+                "prop_type": arguments.get("prop_type", "Any property type"),
+                "customer_type": customer_type
             }
             save_customer(phone, enquiry, listings)
             customer = get_customer(phone)
             rejected = set(customer.get("rejected_listings", []) if customer else [])
-            print(f'[TOOLS] Listings retrieved from scrape_exp: {listings[:3]}...')  # Log first 2 listings for brevity
+            print(f'[TOOLS] Listings retrieved from scrape_exp: {listings[:3]}...')
+            unavailable_status = "Let Agreed" if listing_type == "rental" else "Sold STC"
             formatted_listings_for_response = [
                 {
                     "address": l["address"],
@@ -452,7 +505,7 @@ def handle_tool_call(function_name: str, arguments: dict, phone: str, history: l
                     "property_type": l.get("property_type", ""),
                 }
                 for l in listings
-                if l.get("status") != "Sold STC" and l.get("url") not in rejected
+                if l.get("status") != unavailable_status and l.get("url") not in rejected
             ]
         return json.dumps(formatted_listings_for_response)
     elif function_name == "get_property_details":
@@ -504,24 +557,37 @@ def handle_tool_call(function_name: str, arguments: dict, phone: str, history: l
             "not_interested": "Not interested"
         }
 
+        # [OLD — Jira webhook]
+        # try:
+        #     response = requests.post(
+        #         os.environ["JIRA_WEBHOOK_URL"],
+        #         json={
+        #             "event_type": "customer_inactive",
+        #             "reason": reason_labels.get(reason, reason),
+        #             "customer_name": contact_name,
+        #             "customer_phone_number": phone,
+        #             "last_five_messages": last_five_messages
+        #         },
+        #         headers={
+        #             "Content-Type": "application/json",
+        #             "X-Automation-Webhook-Token": os.environ["JIRA_WEBHOOK_TOKEN"]
+        #         }
+        #     )
+        #     print(f"[TOOL] Jira webhook response: {response.status_code}")
+        # except Exception as e:
+        #     print(f"[TOOL] ERROR sending Jira webhook for inactive customer: {e}")
+
         try:
-            response = requests.post(
-                os.environ["JIRA_WEBHOOK_URL"],
-                json={
-                    "event_type": "customer_inactive",
-                    "reason": reason_labels.get(reason, reason),
-                    "customer_name": contact_name,
-                    "customer_phone_number": phone,
-                    "last_five_messages": last_five_messages
-                },
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Automation-Webhook-Token": os.environ["JIRA_WEBHOOK_TOKEN"]
-                }
+            responsible_agent_email = customer.get("responsible_agent_email", "") if customer else ""
+            send_inactive_notification(
+                contact_name=contact_name,
+                customer_phone=phone,
+                reason=reason_labels.get(reason, reason),
+                responsible_agent_email=responsible_agent_email,
+                last_five_messages=last_five_messages,
             )
-            print(f"[TOOL] Jira webhook response: {response.status_code}")
         except Exception as e:
-            print(f"[TOOL] ERROR sending Jira webhook for inactive customer: {e}")
+            print(f"[TOOL] ERROR sending inactive notification: {e}")
 
         return "Customer marked as inactive."
     elif function_name == "book_viewing":
@@ -542,21 +608,16 @@ def handle_tool_call(function_name: str, arguments: dict, phone: str, history: l
         last_five_messages = history[-5:] if history else []
         last_five_messages = make_readable_conversation_history(last_five_messages)
         print(f"[TOOLS] Last 5 messages for context: {last_five_messages}")
-        
-        
+
+        responsible_agent_email = customer.get("responsible_agent_email", agent_email) if customer else "jeroen.hoppe@exp.uk.com"
 
 
 
-        # Send a Jira automation request to email the estate agent user, in this case Jerone
-        #         curl -X POST -H 'Content-type: application/json' -H 'X-Automation-Webhook-Token: b86ad9ae1a22952195fd9c8bc1a3f7aef425e38e' -d '{"property_listing_url": "abc", "property_address": "123 Sunset Road", "customer_name": "Stephen", "customer_phone_number": "07384950299", "customer_availability": "Next week Tuesday and Wednesday all day"}' \
-        # https://api-private.atlassian.com/automation/webhooks/jira/a/c7fd72bd-66a0-46b1-9ceb-3d17c128b3dc/019d8ae2-2ac7-79fa-b367-e27c713bb0ca
-        jira_automation_url = os.environ["JIRA_WEBHOOK_URL"]
 
-        headers = {
-            "Content-Type": "application/json",
-            "X-Automation-Webhook-Token": os.environ["JIRA_WEBHOOK_TOKEN"]
-        }
-
+        # [OLD — Zapier/Jira]
+        #jira_automation_url = os.environ["JIRA_WEBHOOK_URL"]
+        zapier_send_email_url = os.environ["ZAPIER_SEND_EMAIL_URL"]
+        headers = {"Content-Type": "application/json"}
         payload = {
             "property_listing_url": arguments.get("property_url", ""),
             "property_address": arguments.get("property_address", ""),
@@ -564,19 +625,46 @@ def handle_tool_call(function_name: str, arguments: dict, phone: str, history: l
             "customer_name": contact_name,
             "customer_phone_number": phone,
             "customer_availability": arguments.get("preferred_time", ""),
-            # New additions from Jerone's request:
             "agent_name": agent_name,
             "agent_phone": agent_phone,
             "agent_email": agent_email,
+            "responsible_agent_email": responsible_agent_email,
             "last_five_messages": last_five_messages
         }
-
-        response = requests.post(jira_automation_url, json=payload, headers=headers)
-
+        response = requests.post(zapier_send_email_url, json=payload, headers=headers)
         print(response.status_code)
         print(response.text)
 
-        # e.g. send_sms(AGENT_PHONE, f"Viewing request from {phone} for {arguments['property_address']} at {arguments.get('preferred_time')}")
+        # send_viewing_request(
+        #     contact_name=contact_name,
+        #     customer_phone=phone,
+        #     property_address=arguments.get("property_address", ""),
+        #     property_url=arguments.get("property_url", ""),
+        #     property_price=price,
+        #     agent_name=agent_name,
+        #     agent_phone=agent_phone,
+        #     agent_email=agent_email,
+        #     responsible_agent_email=responsible_agent_email,
+        #     availability=arguments.get("preferred_time", ""),
+        #     last_five_messages=last_five_messages,
+        # )
+
+        responsible_agent_id = customer.get('responsible_agent_id', '') if customer else ''
+        customer_type = customer.get('customer_type', '') if customer else ''
+
+        emit_metric('viewing_booked', agent_id=responsible_agent_id, customer_id=phone, customer_type=customer_type, metadata={
+            'property_url':   arguments.get('property_url', ''),
+            'preferred_time': arguments.get('preferred_time', ''),
+        })
+
+        # Referral: customer viewing a property not listed by their responsible agent
+        if agent_email and responsible_agent_email and agent_email != responsible_agent_email:
+            print(f"[TOOLS] Referral detected — listing agent {agent_email} ≠ responsible agent {responsible_agent_email}")
+            emit_metric('referral', agent_id=responsible_agent_id, customer_id=phone, customer_type=customer_type, metadata={
+                'referred_to_agent_email': agent_email,
+                'property_url':            arguments.get('property_url', ''),
+            })
+
         return json.dumps({"success": True, "message": "Viewing request recorded"})
 
     elif function_name == "update_crm":
